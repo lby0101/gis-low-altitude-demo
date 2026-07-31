@@ -1,0 +1,732 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>点光源 - PointLight</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Cesium.js"></script>
+    <link
+      href="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Widgets/widgets.css"
+      rel="stylesheet"
+    />
+    <style>
+      html,
+      body,
+      #app,
+      #cesiumContainer {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #000;
+      }
+
+      .lil-gui {
+        top: 10px;
+        left: 10px;
+        z-index: 999;
+      }
+
+      /* 点击地图拾取坐标提示 */
+      .click-hint {
+        position: absolute;
+        bottom: 30px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 10;
+        background: rgba(15, 23, 42, 0.85);
+        backdrop-filter: blur(8px);
+        border: 1px solid rgba(250, 204, 21, 0.4);
+        border-radius: 8px;
+        padding: 6px 18px;
+        color: #facc15;
+        font-size: 13px;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="cesiumContainer"></div>
+      <div v-if="isPlacingLight" class="click-hint" style="border-color: rgba(34,197,94,0.5); color: #4ade80;">
+        👆 点击地图放置点光源（ESC 取消）
+      </div>
+    </div>
+
+    <script type="module">
+      const { createApp } = Vue;
+      import GUI from "https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.esm.js";
+
+      /* ================================================================
+       *  PointLight
+       * ================================================================ */
+      class PointLight {
+        /**
+         * @param {Cesium.Cartesian3} position
+         * @param {object} options
+         * @param {Cesium.Color} [options.color=Cesium.Color.WHITE]
+         * @param {number} [options.cutoffDistance=470]
+         * @param {number} [options.decay=2.5]
+         * @param {number} [options.intensity=4.7]
+         */
+        constructor(position, options = {}) {
+          if (!(position instanceof Cesium.Cartesian3)) {
+            throw new Error("PointLight: position must be a Cesium.Cartesian3");
+          }
+          this._position = Cesium.Cartesian3.clone(position);
+          this.__positionCV = Cesium.Cartesian3.clone(position);
+
+          this._color = options.color
+            ? Cesium.Color.clone(options.color)
+            : Cesium.Color.clone(Cesium.Color.WHITE);
+          this._cutoffDistance = options.cutoffDistance ?? 470;
+          this._decay = options.decay ?? 2.5;
+          this._intensity = options.intensity ?? 4.7;
+
+          this.lightType = 1;  // 1 = 点光源
+          this.id = Cesium.createGuid();
+        }
+
+        get position() { return this._position; }
+        set position(v) { if (v instanceof Cesium.Cartesian3) this._position = Cesium.Cartesian3.clone(v); }
+        get _positionCV() { return this.__positionCV; }
+        set _positionCV(v) { if (v instanceof Cesium.Cartesian3) this.__positionCV = Cesium.Cartesian3.clone(v); }
+        get color() { return this._color; }
+        set color(v) { if (v instanceof Cesium.Color) this._color = Cesium.Color.clone(v); }
+        get cutoffDistance() { return this._cutoffDistance; }
+        set cutoffDistance(v) { this._cutoffDistance = Number(v); }
+        get decay() { return this._decay; }
+        set decay(v) { this._decay = Number(v); }
+        get intensity() { return this._intensity; }
+        set intensity(v) { this._intensity = Number(v); }
+      }
+
+      /* ================================================================
+       *  LightSourceManager（点光源专版）
+       *  从 LightSourceManager.js 摘出，只保留 PointLight 链路
+       * ================================================================ */
+      const MAX_POINT_LIGHTS = 16;
+
+      class LightSourceManager {
+        constructor(viewer) {
+          if (!viewer) throw new Error("LightSourceManager: viewer is required");
+          this._viewer = viewer;
+          this._pointLights = [];
+          this._appliedPrimitives = new Map();
+          this._autoUpdate = true;
+          this._removeUpdateListener = null;
+
+          // 预分配 uniform 值对象 — Cesium 通过引用读取，每帧只 mutate
+          this._uniformStorage = this._createUniformStorage();
+
+          if (this._autoUpdate) {
+            this._removeUpdateListener = this._viewer.scene.preUpdate.addEventListener(
+              () => this._updateUniforms()
+            );
+          }
+        }
+
+        // ── 灯光管理 ──
+        addLightSource(light) {
+          if (!light || light.lightType !== 1) return;
+          if (this._pointLights.length >= MAX_POINT_LIGHTS) {
+            console.warn(`[LightSource] 点光源已达上限 ${MAX_POINT_LIGHTS}`);
+            return;
+          }
+          this._pointLights.push(light);
+          this._rebuildShaders();
+        }
+
+        removeLightSource(light) {
+          if (!light) return;
+          const idx = this._pointLights.indexOf(light);
+          if (idx !== -1) {
+            this._pointLights.splice(idx, 1);
+            this._rebuildShaders();
+          }
+        }
+
+        clear() {
+          this._pointLights.length = 0;
+          this._rebuildShaders();
+        }
+
+        get pointLight() { return { values: this._pointLights }; }
+        get pointLightCount() { return this._pointLights.length; }
+
+        // ── 应用 / 移除 CustomShader ──
+        applyToPrimitive(primitive) {
+          if (!primitive) return;
+          if (this._appliedPrimitives.has(primitive)) {
+            primitive.customShader = undefined;
+          }
+          const shader = this._buildCustomShader();
+          primitive.customShader = shader ?? undefined;
+          this._appliedPrimitives.set(primitive, { shader: shader ?? null });
+        }
+
+        removeFromPrimitive(primitive) {
+          if (this._appliedPrimitives.has(primitive)) {
+            primitive.customShader = undefined;
+            this._appliedPrimitives.delete(primitive);
+          }
+        }
+
+        destroy() {
+          if (this._removeUpdateListener) {
+            this._removeUpdateListener();
+            this._removeUpdateListener = null;
+          }
+          this._appliedPrimitives.forEach((_entry, primitive) => {
+            primitive.customShader = undefined;
+          });
+          this._appliedPrimitives.clear();
+          this._pointLights.length = 0;
+        }
+
+        // ══════════ 内部实现 ══════════
+
+        _createUniformStorage() {
+          const storage = {
+            pointPos: [],
+            pointColor: [],
+            pointParams: [],
+          };
+          for (let i = 0; i < MAX_POINT_LIGHTS; i++) {
+            storage.pointPos.push(new Cesium.Cartesian3(0, 0, 0));
+            storage.pointColor.push(new Cesium.Color(0, 0, 0, 0));
+            storage.pointParams.push(new Cesium.Cartesian3(0, 0, 0));
+          }
+          return storage;
+        }
+
+        _updateUniforms() {
+          if (this._appliedPrimitives.size === 0) return;
+          const frameState = this._viewer.scene.frameState;
+          if (!frameState) return;
+          this._writePointLightUniforms(frameState);
+        }
+
+        _writePointLightUniforms(frameState) {
+          const s = this._uniformStorage;
+          for (let i = 0; i < MAX_POINT_LIGHTS; i++) {
+            const light = this._pointLights[i];
+            const color = s.pointColor[i];
+            const params = s.pointParams[i];
+            if (light) {
+              // 世界坐标 → 眼坐标
+              this._toEyeCoords(light.position, frameState, s.pointPos[i]);
+              color.red = light.color.red;
+              color.green = light.color.green;
+              color.blue = light.color.blue;
+              color.alpha = 1.0;
+              params.x = light.cutoffDistance;
+              params.y = light.decay;
+              params.z = light.intensity;
+            } else {
+              color.alpha = 0.0; // 空槽位：关闭
+            }
+          }
+        }
+
+        _toEyeCoords(worldPos, frameState, result) {
+          const mat = frameState?.camera
+            ? frameState.camera.viewMatrix
+            : this._viewer.camera.viewMatrix;
+          return Cesium.Matrix4.multiplyByPoint(mat, worldPos, result);
+        }
+
+        // ── Shader 构建 ──
+        _buildCustomShader() {
+          if (this._pointLights.length === 0) return undefined;
+          return new Cesium.CustomShader({
+            mode: Cesium.CustomShaderMode.MODIFY_MATERIAL,
+            uniforms: this._buildUniformDefs(),
+            fragmentShaderText: this._buildFragmentShader(),
+          });
+        }
+
+        _buildUniformDefs() {
+          const uniforms = {};
+          const s = this._uniformStorage;
+          for (let i = 0; i < MAX_POINT_LIGHTS; i++) {
+            uniforms[`u_pointLightPos_${i}`] = {
+              type: Cesium.UniformType.VEC3,
+              value: s.pointPos[i],
+            };
+            uniforms[`u_pointLightColor_${i}`] = {
+              type: Cesium.UniformType.VEC4,
+              value: s.pointColor[i],
+            };
+            uniforms[`u_pointLightParams_${i}`] = {
+              type: Cesium.UniformType.VEC3,
+              value: s.pointParams[i],
+            };
+          }
+          return uniforms;
+        }
+
+        _buildFragmentShader() {
+          const pointBlocks = this._pointLights.map((_light, i) => `
+              // 💡 点光源 ${i}
+              if (u_pointLightColor_${i}.a >= 0.001) {
+                vec3 L = u_pointLightPos_${i} - positionEC;
+                float dist = length(L);
+                vec3 Ln = L / max(dist, 0.001);
+                float cutoff    = u_pointLightParams_${i}.x;
+                float decay     = u_pointLightParams_${i}.y;
+                float intensity = u_pointLightParams_${i}.z;
+                float ratio = dist / max(cutoff, 0.001);
+                float falloff = pow(clamp(1.0 - ratio, 0.0, 1.0), decay + 1.0);
+                float attenuation = intensity * falloff;
+                float NdotL = max(dot(normalEC, Ln), 0.0);
+                material.diffuse += u_pointLightColor_${i}.rgb * NdotL * attenuation;
+              }
+            `).join("\n");
+
+          return `
+            void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material)
+            {
+              vec3 positionEC = fsInput.attributes.positionEC;
+              vec3 normalEC   = normalize(fsInput.attributes.normalEC);
+              ${pointBlocks}
+            }
+          `;
+        }
+
+        _rebuildShaders() {
+          if (this._appliedPrimitives.size === 0) return;
+          const totalLights = this._pointLights.length;
+          this._appliedPrimitives.forEach((entry, primitive) => {
+            if (totalLights === 0) {
+              primitive.customShader = undefined;
+              entry.shader = null;
+            } else {
+              const shader = this._buildCustomShader();
+              primitive.customShader = shader;
+              entry.shader = shader;
+            }
+          });
+        }
+      }
+
+      /* ================================================================
+       *  Vue 应用
+       * ================================================================ */
+      createApp({
+        data() {
+          return {
+            viewer: null,
+            lightMgr: null,
+            tileset: null,
+            gui: null,
+            lightFolders: [],        // { light, folder, controllers, colorCtrl }
+            lightCounter: 0,
+            isPlacingLight: false,
+            // 新建光源参数
+            newLight: {
+              lng: 120.595,
+              lat: 32.472,
+              height: 150,
+              color: "#ffaa00",
+              intensity: 5.0,
+              cutoffDistance: 500,
+              decay: 2.0,
+            },
+            // 场景参数
+            scene: {
+              timeOfDay: 0,          // 0-24 小时
+              showImagery: true,
+              imageryAlpha: 1.0,
+              resetCamera: () => this.doResetCamera(),
+            },
+          };
+        },
+        async mounted() {
+          const viewer = this.initMap();
+
+          // 初始化光源管理器
+          this.lightMgr = new LightSourceManager(viewer);
+
+          // 加载 3D Tileset
+          await this.add3DTileset(viewer);
+
+          // 构建 lil-gui
+          this.buildGui();
+
+          // 时钟拨到午夜
+          this.applyTimeOfDay(0);
+
+          // ESC 取消放置模式
+          this._onKeyDown = (e) => {
+            if (e.key === "Escape" && this.isPlacingLight) {
+              this.exitPlacingMode();
+            }
+          };
+          document.addEventListener("keydown", this._onKeyDown);
+        },
+        beforeUnmount() {
+          if (this._onKeyDown) {
+            document.removeEventListener("keydown", this._onKeyDown);
+            this._onKeyDown = null;
+          }
+          if (this._clickHandler) {
+            this._clickHandler.destroy();
+            this._clickHandler = null;
+          }
+          if (this.lightMgr) {
+            this.lightMgr.destroy();
+            this.lightMgr = null;
+          }
+          if (this.tileset && this.viewer) {
+            this.viewer.scene.primitives.remove(this.tileset);
+            this.tileset = null;
+          }
+          if (this.gui) {
+            this.gui.destroy();
+            this.gui = null;
+          }
+        },
+        methods: {
+          /* ---------- 地图初始化 ---------- */
+          initMap() {
+            const viewer = new Cesium.Viewer("cesiumContainer", {
+              baseLayer: false,
+              animation: false,
+              timeline: false,
+              fullscreenButton: false,
+              infoBox: false,
+              geocoder: false,
+              homeButton: false,
+              sceneModePicker: false,
+              baseLayerPicker: false,
+              navigationHelpButton: false,
+              selectionIndicator: false,
+              shouldAnimate: false,
+            });
+
+            window.viewer = viewer;
+            viewer.scene.debugShowFramesPerSecond = true;
+            viewer.scene.globe.enableLighting = true;
+            viewer.scene.highDynamicRange = true;
+            viewer.scene.fog.enabled = true;
+            viewer.scene.fog.density = 0.00008;
+            viewer.scene.skyAtmosphere.show = true;
+            viewer._cesiumWidget._creditContainer.style.display = "none";
+
+            // 默认 ESRI 影像
+            const imageryLayer = viewer.imageryLayers.addImageryProvider(
+              new Cesium.UrlTemplateImageryProvider({
+                url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                maximumLevel: 18,
+              }),
+            );
+            this.viewer = viewer;
+            this.imageryLayer = imageryLayer;
+
+            this.doResetCamera();
+
+            // 地图点击 → 拾取坐标
+            this._clickHandler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
+            this._clickHandler.setInputAction(
+              (event) => this.onMapClick(event.position),
+              Cesium.ScreenSpaceEventType.LEFT_CLICK,
+            );
+
+            return viewer;
+          },
+
+          /* ---------- 地图点击 ---------- */
+          onMapClick(screenPos) {
+            if (!this.isPlacingLight) return;
+
+            const viewer = this.viewer;
+            let cartesian;
+            const ray = viewer.camera.getPickRay(screenPos);
+            if (ray) {
+              cartesian = viewer.scene.globe.pick(ray, viewer.scene);
+            }
+            if (!cartesian) {
+              cartesian = viewer.camera.pickEllipsoid(screenPos, viewer.scene.globe.ellipsoid);
+            }
+            if (!cartesian) return;
+
+            const carto = Cesium.Cartographic.fromCartesian(cartesian);
+            const lng = +Cesium.Math.toDegrees(carto.longitude).toFixed(6);
+            const lat = +Cesium.Math.toDegrees(carto.latitude).toFixed(6);
+
+            // 更新参数并同步回 lil-gui 控件
+            this.newLight.lng = lng;
+            this.newLight.lat = lat;
+            if (this._newLightCtrls) {
+              this._newLightCtrls.lng?.updateDisplay();
+              this._newLightCtrls.lat?.updateDisplay();
+            }
+
+            // 直接添加点光源
+            this.addPointLight();
+
+            // 退出放置模式
+            this.exitPlacingMode();
+          },
+
+          /* ---------- 放置模式 ---------- */
+          enterPlacingMode() {
+            this.isPlacingLight = true;
+            this.viewer.scene.canvas.style.cursor = "crosshair";
+          },
+
+          exitPlacingMode() {
+            this.isPlacingLight = false;
+            this.viewer.scene.canvas.style.cursor = "";
+          },
+
+          /* ---------- 重置视角 ---------- */
+          doResetCamera() {
+            if (!this.viewer) return;
+            this.viewer.camera.setView({
+              destination: Cesium.Cartesian3.fromDegrees(120.592886, 32.470705, 20000000),
+              orientation: {
+                heading: Cesium.Math.toRadians(0),
+                pitch: Cesium.Math.toRadians(-90),
+                roll: Cesium.Math.toRadians(0),
+              },
+            });
+          },
+
+          /* ---------- 时刻 → 当地时间午夜 ── */
+          applyTimeOfDay(hour) {
+            const viewer = this.viewer;
+            if (!viewer) return;
+
+            // 取 tileset 中心所在经度，按当地时区推算 UTC
+            // （简单处理：tileset 在 120.6°E ≈ UTC+8）
+            const now = Cesium.JulianDate.now();
+            const g = Cesium.JulianDate.toGregorianDate(now);
+
+            // 设定为今天的 hour:00:00（UTC+8 → UTC）
+            g.hour = Math.floor(hour) - 8;
+            g.minute = Math.round((hour - Math.floor(hour)) * 60);
+            g.second = 0;
+            g.millisecond = 0;
+
+            const jd = Cesium.JulianDate.fromGregorianDate(g);
+            viewer.clock.currentTime = jd;
+          },
+
+          /* ---------- 3D Tileset ---------- */
+          async add3DTileset(viewer) {
+            try {
+              const tileset = await Cesium.Cesium3DTileset.fromUrl(
+                "./data/tileset/baimo/tileset.json",
+                { maximumScreenSpaceError: 10, maximumMemoryUsage: 5120 },
+              );
+              this.tileset = tileset;
+              viewer.scene.primitives.add(tileset);
+              this.lightMgr.applyToPrimitive(tileset);
+              await viewer.zoomTo(tileset);
+
+              // 飞到 45° 俯视角便于观察光照
+              viewer.camera.moveBackward(300);
+              console.log("✅ 3D Tileset 加载成功，点光源管理器已就绪");
+            } catch (err) {
+              console.warn("❌ 3D Tileset 加载失败:", err.message);
+            }
+          },
+
+          /* ---------- 颜色换算 ---------- */
+          hexToCesiumColor(hex) {
+            const r = parseInt(hex.slice(1, 3), 16) / 255;
+            const g = parseInt(hex.slice(3, 5), 16) / 255;
+            const b = parseInt(hex.slice(5, 7), 16) / 255;
+            return new Cesium.Color(r, g, b);
+          },
+
+          /* ---------- 添加/删除 Entity 标记 ---------- */
+          addEntityMarker(cartesian, color, label) {
+            return this.viewer.entities.add({
+              position: cartesian,
+              point: {
+                pixelSize: 12,
+                color,
+                outlineColor: Cesium.Color.BLACK,
+                outlineWidth: 2,
+                disableDepthTestDistance: Number.POSITIVE_INFINITY,
+              },
+              label: {
+                text: label,
+                font: "12px sans-serif",
+                fillColor: Cesium.Color.WHITE,
+                style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                outlineColor: Cesium.Color.BLACK,
+                outlineWidth: 2,
+                pixelOffset: new Cesium.Cartesian2(0, -18),
+                disableDepthTestDistance: Number.POSITIVE_INFINITY,
+              },
+            });
+          },
+
+          removeEntityMarker(entity) {
+            if (entity) this.viewer.entities.remove(entity);
+          },
+
+          /* ══════════ lil-gui 面板 ══════════ */
+          buildGui() {
+            const gui = new GUI({ title: "💡 点光源控制" });
+            this.gui = gui;
+
+            // ── 新建点光源 ──
+            const newFolder = gui.addFolder("新建点光源");
+            this._newLightCtrls = {};
+
+            this._newLightCtrls.lng = newFolder
+              .add(this.newLight, "lng", 119, 122, 0.000001)
+              .name("经度 lng");
+            this._newLightCtrls.lat = newFolder
+              .add(this.newLight, "lat", 30, 33, 0.000001)
+              .name("纬度 lat");
+            newFolder.add(this.newLight, "height", 0, 1000, 1).name("高度 (m)");
+            newFolder.addColor(this.newLight, "color").name("颜色");
+            newFolder.add(this.newLight, "intensity", 0, 20, 0.1).name("强度");
+            newFolder.add(this.newLight, "cutoffDistance", 10, 2000, 10).name("影响距离 (m)");
+            newFolder.add(this.newLight, "decay", 0.1, 10, 0.1).name("衰减系数");
+
+            // 添加 / 清空按钮
+            const btnFolder = gui.addFolder("操作");
+            btnFolder.add(
+              { addLight: () => this.enterPlacingMode() },
+              "addLight",
+            ).name("➕ 添加点光源");
+            btnFolder.add(
+              { clearAll: () => this.clearAllLights() },
+              "clearAll",
+            ).name("🗑️ 清空所有光源");
+
+            // ── 场景控制 ──
+            const sceneFolder = gui.addFolder("场景");
+            sceneFolder.add(this.scene, "timeOfDay", 0, 24, 0.25)
+              .name("时刻 (0-24h)")
+              .onChange((v) => this.applyTimeOfDay(v));
+            sceneFolder.add(this.scene, "showImagery")
+              .name("影像图层")
+              .onChange((v) => { this.imageryLayer.show = v; });
+            sceneFolder.add(this.scene, "imageryAlpha", 0, 1, 0.01)
+              .name("影像透明度")
+              .onChange((v) => { this.imageryLayer.alpha = v; });
+            sceneFolder.add(this.scene, "resetCamera").name("重置视角");
+          },
+
+          /* ---------- 添加点光源 ---------- */
+          addPointLight() {
+            const nl = this.newLight;
+            const pos = Cesium.Cartesian3.fromDegrees(nl.lng, nl.lat, nl.height);
+            const color = this.hexToCesiumColor(nl.color);
+
+            const light = new PointLight(pos, {
+              color,
+              intensity: nl.intensity,
+              cutoffDistance: nl.cutoffDistance,
+              decay: nl.decay,
+            });
+
+            this.lightMgr.addLightSource(light);
+            this.lightCounter++;
+            const lid = this.lightCounter;
+
+            // Entity 标记
+            const entity = this.addEntityMarker(pos, color, `💡 #${lid}`);
+
+            // 在 lil-gui 中创建专属 folder
+            const folder = this.gui.addFolder(`💡 点光源 #${lid}`);
+
+            const params = {
+              lng: nl.lng,
+              lat: nl.lat,
+              height: nl.height,
+              color: nl.color,
+              intensity: nl.intensity,
+              cutoffDistance: nl.cutoffDistance,
+              decay: nl.decay,
+              remove: () => this.removePointLight(lid),
+            };
+
+            // 位置 → 光源属性 + entity
+            folder.add(params, "lng", 119, 122, 0.000001).name("经度")
+              .onChange((v) => {
+                params.lng = v;
+                const p = Cesium.Cartesian3.fromDegrees(params.lng, params.lat, params.height);
+                light.position = p;
+                entity.position = new Cesium.ConstantPositionProperty(p);
+              });
+            folder.add(params, "lat", 30, 33, 0.000001).name("纬度")
+              .onChange((v) => {
+                params.lat = v;
+                const p = Cesium.Cartesian3.fromDegrees(params.lng, params.lat, params.height);
+                light.position = p;
+                entity.position = new Cesium.ConstantPositionProperty(p);
+              });
+            folder.add(params, "height", 0, 1000, 1).name("高度")
+              .onChange((v) => {
+                params.height = v;
+                const p = Cesium.Cartesian3.fromDegrees(params.lng, params.lat, params.height);
+                light.position = p;
+                entity.position = new Cesium.ConstantPositionProperty(p);
+              });
+
+            folder.addColor(params, "color").name("颜色")
+              .onChange((v) => {
+                params.color = v;
+                const c = this.hexToCesiumColor(v);
+                light.color = c;
+                entity.point.color = new Cesium.ConstantProperty(c);
+              });
+
+            folder.add(params, "intensity", 0, 20, 0.1).name("强度")
+              .onChange((v) => { light.intensity = v; });
+            folder.add(params, "cutoffDistance", 10, 2000, 10).name("影响距离")
+              .onChange((v) => { light.cutoffDistance = v; });
+            folder.add(params, "decay", 0.1, 10, 0.1).name("衰减系数")
+              .onChange((v) => { light.decay = v; });
+            folder.add(params, "remove").name("❌ 删除");
+
+            this.lightFolders.push({ light, folder, params, entity, id: lid });
+
+            console.log(
+              `💡 点光源 #${lid} 已添加 — 共 ${this.lightMgr.pointLightCount} 盏`,
+            );
+          },
+
+          /* ---------- 删除点光源 ---------- */
+          removePointLight(lid) {
+            const idx = this.lightFolders.findIndex((lf) => lf.id === lid);
+            if (idx === -1) return;
+
+            const { light, folder, entity } = this.lightFolders[idx];
+            this.lightMgr.removeLightSource(light);
+            this.removeEntityMarker(entity);
+            folder.destroy();
+            this.lightFolders.splice(idx, 1);
+
+            console.log(
+              `🗑️ 点光源 #${lid} 已删除 — 剩余 ${this.lightMgr.pointLightCount} 盏`,
+            );
+          },
+
+          /* ---------- 清空所有 ---------- */
+          clearAllLights() {
+            [...this.lightFolders].forEach(({ light, folder, entity }) => {
+              this.lightMgr.removeLightSource(light);
+              this.removeEntityMarker(entity);
+              folder.destroy();
+            });
+            this.lightFolders.length = 0;
+            console.log("🗑️ 所有点光源已清空");
+          },
+        },
+      }).mount("#app");
+    </script>
+  </body>
+</html>
