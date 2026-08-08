@@ -1,0 +1,1234 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>地形开挖</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Cesium.js"></script>
+    <link
+      href="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Widgets/widgets.css"
+      rel="stylesheet"
+    />
+    <style>
+      html,
+      body,
+      #app,
+      #cesiumContainer {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #000;
+      }
+
+      .lil-gui {
+        top: 10px;
+        left: 10px;
+        z-index: 999;
+      }
+
+      .status-panel {
+        position: absolute;
+        left: 10px;
+        bottom: 10px;
+        z-index: 998;
+        min-width: 280px;
+        padding: 10px 12px;
+        border-radius: 6px;
+        color: #e8f1ff;
+        background: rgba(12, 18, 28, 0.78);
+        font-size: 13px;
+        line-height: 1.7;
+        pointer-events: none;
+        white-space: pre-line;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="cesiumContainer"></div>
+      <div class="status-panel">{{ statusText }}</div>
+    </div>
+
+    <script type="module">
+      const { createApp } = Vue;
+      import GUI from "https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.esm.js";
+
+      // ============================================================
+      // 程序化纹理：不依赖外部图片，直接用 canvas 生成
+      // ============================================================
+
+      /** 侧壁：水平层理 + 颗粒噪声，模拟土层剖面 */
+      function makeStrataTexture(size = 256) {
+        const canvas = document.createElement("canvas");
+        canvas.width = canvas.height = size;
+        const ctx = canvas.getContext("2d");
+
+        ctx.fillStyle = "#8b6f4e";
+        ctx.fillRect(0, 0, size, size);
+
+        // 水平地层条带
+        const bands = 16;
+        for (let i = 0; i < bands; i++) {
+          const k = 0.72 + Math.random() * 0.56;
+          const r = Math.min(255, 139 * k) | 0;
+          const g = Math.min(255, 111 * k) | 0;
+          const b = Math.min(255, 78 * k) | 0;
+          ctx.fillStyle = `rgb(${r},${g},${b})`;
+          ctx.fillRect(0, (i * size) / bands, size, size / bands + 1);
+        }
+
+        // 颗粒噪声
+        const img = ctx.getImageData(0, 0, size, size);
+        const data = img.data;
+        for (let i = 0; i < data.length; i += 4) {
+          const n = (Math.random() - 0.5) * 44;
+          data[i] += n;
+          data[i + 1] += n;
+          data[i + 2] += n;
+        }
+        ctx.putImageData(img, 0, 0);
+
+        // 竖向裂隙
+        ctx.strokeStyle = "rgba(60,44,28,0.45)";
+        for (let i = 0; i < 10; i++) {
+          ctx.lineWidth = 0.5 + Math.random() * 1.5;
+          ctx.beginPath();
+          let x = Math.random() * size;
+          ctx.moveTo(x, 0);
+          for (let y = 0; y <= size; y += 16) {
+            x += (Math.random() - 0.5) * 12;
+            ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+        }
+        return canvas;
+      }
+
+      /** 底面：碎石 / 夯土质感 */
+      function makeGravelTexture(size = 256) {
+        const canvas = document.createElement("canvas");
+        canvas.width = canvas.height = size;
+        const ctx = canvas.getContext("2d");
+
+        ctx.fillStyle = "#9c8a72";
+        ctx.fillRect(0, 0, size, size);
+
+        for (let i = 0; i < 900; i++) {
+          const k = 0.6 + Math.random() * 0.7;
+          const r = Math.min(255, 156 * k) | 0;
+          const g = Math.min(255, 138 * k) | 0;
+          const b = Math.min(255, 114 * k) | 0;
+          ctx.fillStyle = `rgba(${r},${g},${b},0.85)`;
+          ctx.beginPath();
+          ctx.ellipse(
+            Math.random() * size,
+            Math.random() * size,
+            1 + Math.random() * 4,
+            1 + Math.random() * 3,
+            Math.random() * Math.PI,
+            0,
+            Math.PI * 2,
+          );
+          ctx.fill();
+        }
+
+        const img = ctx.getImageData(0, 0, size, size);
+        const data = img.data;
+        for (let i = 0; i < data.length; i += 4) {
+          const n = (Math.random() - 0.5) * 30;
+          data[i] += n;
+          data[i + 1] += n;
+          data[i + 2] += n;
+        }
+        ctx.putImageData(img, 0, 0);
+        return canvas;
+      }
+
+      // ============================================================
+      // 地形开挖核心类
+      //   1) 裁剪：ClippingPlanes / ClippingPolygons 在地形上挖出空洞
+      //   2) 底面：Polygon 实体，高程 = 区域最低地形高 - 开挖深度
+      //   3) 侧壁：Wall 实体，顶随地形起伏、底与底面齐平
+      // ============================================================
+      class TerrainExcavation {
+        constructor(options) {
+          this.viewer = options.viewer;
+          this.depth = options.depth ?? 60;
+          this.splitNum = options.splitNum ?? 50; // 每条边的加密采样点数
+          this.topOffset = options.topOffset ?? 1; // 侧壁顶部抬高，遮住与地形的缝隙
+          this.clipMode = options.clipMode ?? "planes";
+          this.edgeColor = options.edgeColor ?? Cesium.Color.OLIVE;
+          this.edgeWidth = options.edgeWidth ?? 1.0;
+          this.bottomMaterial = options.bottomMaterial;
+          this.sideMaterial = options.sideMaterial;
+
+          this.lonLats = []; // [{x: lon, y: lat, z: height}]
+          this.wallDegrees = []; // 加密后的扁平经纬度数组
+          this.sampleCartographics = []; // 与 maxHeights 一一对应的采样点
+          this.detailHeights = []; // 最高 LOD 采样高程（仅作初值与兜底）
+          this.maxHeights = []; // 实际使用的地形高程（跟随渲染面）
+          this.lodDelta = 0; // 精细面与渲染面的最大高差，用于诊断
+          this.topHeights = []; // 侧壁顶 = 地形高程 + 抬高量
+          this.minHeights = []; // 侧壁底（开挖面高程）
+          this.minTerrainHeight = 0;
+          this.maxTerrainHeight = 0;
+          this.baseHeight = 0;
+
+          // 贴图尺度所需的几何量（米），随多边形变化，与深度无关
+          this.perimeter = 0;
+          this.bboxWidth = 0;
+          this.bboxHeight = 0;
+
+          this.bottomEntity = null;
+          this.wallEntity = null;
+
+          this.terrainSyncRemovers = [];
+          this.syncTimer = null; // 高程同步防抖计时器
+          this.runSync = null; // 防抖到期后执行的同步函数
+          this.onSync = options.onSync ?? null; // 高程同步后的回调（刷新面板）
+        }
+
+        // 高程变化小于此值不重建几何体（米）
+        static HEIGHT_EPSILON = 0.5;
+        // 相机停止后延迟多久做同步（毫秒）
+        static SYNC_DEBOUNCE_MS = 350;
+
+        // ---------- 入口 ----------
+
+        /** @param {Cesium.Cartesian3[]} cartesians 地表拾取的多边形顶点 */
+        async excavate(cartesians) {
+          this.destroy();
+
+          // 顶点 → 经纬度，并统一为逆时针，保证裁剪面法线朝外
+          let lonLats = cartesians.map((position) => {
+            const carto = Cesium.Cartographic.fromCartesian(position);
+            return {
+              x: Cesium.Math.toDegrees(carto.longitude),
+              y: Cesium.Math.toDegrees(carto.latitude),
+              z: carto.height,
+            };
+          });
+          if (TerrainExcavation.isClockWise(lonLats)) lonLats.reverse();
+          this.lonLats = lonLats;
+          this.computeFootprint();
+
+          // 边界加密 + 地形高程采样
+          const { degrees, cartographics } = this.densifyBoundary(lonLats);
+          this.wallDegrees = degrees;
+          this.sampleCartographics = cartographics;
+          this.detailHeights = await this.sampleHeights(cartographics);
+          this.maxHeights = this.detailHeights.slice();
+
+          this.updateTerrainRange();
+          this.refreshHeights();
+
+          this.applyClipping();
+          this.createBottom();
+          this.createWall();
+
+          // 墙顶必须贴「渲染面」，不能贴「最高 LOD 面」，否则出现锯齿缝隙
+          this.syncToRenderedTerrain();
+          this.startTerrainSync();
+        }
+
+        /**
+         * 沿每条边线性插值加密，末尾补回首点闭合。
+         * 采样点越密，侧壁顶部与地形贴合越好。
+         */
+        densifyBoundary(lonLats) {
+          const degrees = [];
+          const cartographics = [];
+          const count = lonLats.length;
+          for (let i = 0; i < count; i++) {
+            const start = lonLats[i];
+            const end = lonLats[(i + 1) % count];
+            for (let k = 0; k < this.splitNum; k++) {
+              const t = k / this.splitNum;
+              const lon = Cesium.Math.lerp(start.x, end.x, t);
+              const lat = Cesium.Math.lerp(start.y, end.y, t);
+              degrees.push(lon, lat);
+              cartographics.push(Cesium.Cartographic.fromDegrees(lon, lat));
+            }
+          }
+          degrees.push(lonLats[0].x, lonLats[0].y);
+          cartographics.push(
+            Cesium.Cartographic.fromDegrees(lonLats[0].x, lonLats[0].y),
+          );
+          return { degrees, cartographics };
+        }
+
+        /** 采样地形高程；无地形（椭球体）时退化为顶点高度 */
+        async sampleHeights(cartographics) {
+          const provider = this.viewer.terrainProvider;
+          const fallback = () =>
+            cartographics.map(() => this.lonLats[0]?.z ?? 0);
+          if (!provider || provider instanceof Cesium.EllipsoidTerrainProvider) {
+            return fallback();
+          }
+          try {
+            const samples = await Cesium.sampleTerrainMostDetailed(
+              provider,
+              cartographics,
+            );
+            return samples.map((sample) =>
+              Cesium.defined(sample.height) ? sample.height : 0,
+            );
+          } catch (error) {
+            console.warn("地形高程采样失败，退化为顶点高度", error);
+            return fallback();
+          }
+        }
+
+        updateTerrainRange() {
+          this.minTerrainHeight = this.maxHeights.reduce(
+            (min, h) => Math.min(min, h),
+            Number.POSITIVE_INFINITY,
+          );
+          this.maxTerrainHeight = this.maxHeights.reduce(
+            (max, h) => Math.max(max, h),
+            Number.NEGATIVE_INFINITY,
+          );
+        }
+
+        // ---------- 墙顶与渲染面同步 ----------
+
+        /**
+         * 把墙顶高程换成「当前渲染面」的高程。
+         *
+         * sampleTerrainMostDetailed 取的是数据集最高 LOD 的高程，而 globe 渲染的
+         * 是按屏幕空间误差挑的较粗 LOD 三角网 —— 两者不是同一个面。墙顶贴精细面、
+         * 眼睛看粗糙面，粗糙面高出的地方就会露出锯齿缝隙。
+         * globe.getHeight 是对已加载瓦片的三角网求交，与所见一致。
+         *
+         * @returns {boolean} 高程是否发生了变化
+         */
+        syncToRenderedTerrain() {
+          const globe = this.viewer.scene.globe;
+          if (!this.sampleCartographics.length) return false;
+
+          let changed = false;
+          let delta = 0;
+          for (let i = 0; i < this.sampleCartographics.length; i++) {
+            const height = globe.getHeight(this.sampleCartographics[i]);
+            // 瓦片尚未加载时返回 undefined，保留最高 LOD 采样值兜底
+            if (!Cesium.defined(height)) continue;
+            delta = Math.max(delta, Math.abs(height - this.detailHeights[i]));
+            // 阈值取 0.5 m：LOD 切换带来的亚米级抖动不值得重建几何体，
+            // 用 1e-3 会让 changed 恒为 true，每次相机事件都全量重建。
+            if (Math.abs(height - this.maxHeights[i]) > TerrainExcavation.HEIGHT_EPSILON) {
+              this.maxHeights[i] = height;
+              changed = true;
+            }
+          }
+          this.lodDelta = delta;
+
+          if (changed) {
+            this.updateTerrainRange();
+            this.refreshHeights();
+            if (this.onSync) this.onSync();
+          }
+          return changed;
+        }
+
+        /**
+         * 相机停下后重新同步：LOD 一变，渲染面就变了。
+         *
+         * 用定时器而非 requestAnimationFrame 做防抖 —— 滚轮缩放时每一格都会
+         * 触发一次独立的 moveEnd，rAF 只能合并同一帧内的调用，跨帧的连续滚轮
+         * 拦不住。定时器保证「真正停下来」之后才做一次同步。
+         *
+         * 同时等待瓦片加载完毕：地形还在流式加载时同步，拿到的是中间态高程，
+         * 既浪费一次几何重建，结果也不对。
+         */
+        startTerrainSync() {
+          this.stopTerrainSync();
+          const scene = this.viewer.scene;
+
+          const sync = () => {
+            this.syncTimer = null;
+            // 瓦片仍在加载 → 推迟到加载完成后再同步
+            if (!scene.globe.tilesLoaded) {
+              this.scheduleSync();
+              return;
+            }
+            this.syncToRenderedTerrain();
+          };
+          this.runSync = sync;
+
+          this.terrainSyncRemovers.push(
+            scene.camera.moveEnd.addEventListener(() => this.scheduleSync()),
+          );
+        }
+
+        /** 重置防抖计时器：相机每次停下都往后推，直到真正安静下来 */
+        scheduleSync() {
+          if (this.syncTimer) clearTimeout(this.syncTimer);
+          this.syncTimer = setTimeout(
+            () => this.runSync && this.runSync(),
+            TerrainExcavation.SYNC_DEBOUNCE_MS,
+          );
+        }
+
+        stopTerrainSync() {
+          if (this.syncTimer) {
+            clearTimeout(this.syncTimer);
+            this.syncTimer = null;
+          }
+          this.runSync = null;
+          this.terrainSyncRemovers.forEach((remove) => remove());
+          this.terrainSyncRemovers = [];
+        }
+
+        /** 依据当前深度重算开挖面高程与侧壁上下缘数组，并同步到实体 */
+        refreshHeights() {
+          this.baseHeight = this.minTerrainHeight - this.depth;
+          this.minHeights = this.maxHeights.map(() => this.baseHeight);
+          this.topHeights = this.maxHeights.map((h) => h + this.topOffset);
+
+          // 缓存平均墙高，避免 computeRepeat 每次 O(n) 遍历
+          if (this.topHeights.length) {
+            const sum = this.topHeights.reduce(
+              (acc, top) => acc + (top - this.baseHeight),
+              0,
+            );
+            this._avgWallHeight = sum / this.topHeights.length;
+          } else {
+            this._avgWallHeight = this.depth;
+          }
+
+          // 实体已存在时立即推送（首次开挖时实体尚未创建，由 createXxx 带入初值）
+          this.applyHeights();
+        }
+
+        /**
+         * 量出多边形的周长与东-北向包围盒（米）。
+         * Wall 的纹理坐标 s 沿周长归一化、t 在每根柱子内 0→1，
+         * Polygon 的纹理坐标按包围盒归一化，
+         * 所以这两个量就是把「米」换算成 repeat 的分子。
+         */
+        computeFootprint() {
+          const lonLats = this.lonLats;
+          if (lonLats.length < 3) {
+            this.perimeter = this.bboxWidth = this.bboxHeight = 0;
+            return;
+          }
+          // 局部平面近似：该纬度下 1° 经/纬对应的米数
+          const mx = 111320 * Math.cos(Cesium.Math.toRadians(lonLats[0].y));
+          const my = 110540;
+
+          let perimeter = 0;
+          let minX = Number.POSITIVE_INFINITY;
+          let maxX = Number.NEGATIVE_INFINITY;
+          let minY = Number.POSITIVE_INFINITY;
+          let maxY = Number.NEGATIVE_INFINITY;
+
+          for (let i = 0; i < lonLats.length; i++) {
+            const a = lonLats[i];
+            const b = lonLats[(i + 1) % lonLats.length];
+            perimeter += Math.hypot((b.x - a.x) * mx, (b.y - a.y) * my);
+            minX = Math.min(minX, a.x);
+            maxX = Math.max(maxX, a.x);
+            minY = Math.min(minY, a.y);
+            maxY = Math.max(maxY, a.y);
+          }
+
+          this.perimeter = perimeter;
+          this.bboxWidth = (maxX - minX) * mx;
+          this.bboxHeight = (maxY - minY) * my;
+        }
+
+        /**
+         * 侧壁平均高度（米）。Wall 的 t 是逐柱归一化的，
+         * 高低不一时没有单一真值，取均值让整体比例最接近。
+         */
+        get averageWallHeight() {
+          return this._avgWallHeight ?? this.depth;
+        }
+
+        // ---------- 地形裁剪 ----------
+
+        applyClipping() {
+          this.clearClipping();
+          if (this.clipMode === "polygons") {
+            this.applyClippingPolygons();
+          } else {
+            this.applyClippingPlanes();
+          }
+        }
+
+        /**
+         * 裁剪面方案（参考实现）：每条边生成一个 ClippingPlane，
+         * 取交集裁掉多边形内部。只对「凸多边形」成立。
+         */
+        applyClippingPlanes() {
+          const points = this.lonLats.map((p) =>
+            Cesium.Cartesian3.fromDegrees(p.x, p.y),
+          );
+          const length = points.length;
+          const planes = [];
+
+          for (let i = 0; i < length; i++) {
+            const nextIndex = (i + 1) % length;
+
+            // 边中点
+            let midpoint = Cesium.Cartesian3.add(
+              points[i],
+              points[nextIndex],
+              new Cesium.Cartesian3(),
+            );
+            midpoint = Cesium.Cartesian3.multiplyByScalar(
+              midpoint,
+              0.5,
+              midpoint,
+            );
+
+            // 局部「上」方向（地心指向中点）与边方向
+            const up = Cesium.Cartesian3.normalize(
+              midpoint,
+              new Cesium.Cartesian3(),
+            );
+            let right = Cesium.Cartesian3.subtract(
+              points[nextIndex],
+              midpoint,
+              new Cesium.Cartesian3(),
+            );
+            right = Cesium.Cartesian3.normalize(right, right);
+
+            // 边平面法线 = 边方向 × 上方向
+            let normal = Cesium.Cartesian3.cross(
+              right,
+              up,
+              new Cesium.Cartesian3(),
+            );
+            normal = Cesium.Cartesian3.normalize(normal, normal);
+
+            // 过原点的同法向平面到中点的距离，即平面偏移量
+            const originCenteredPlane = new Cesium.Plane(normal, 0.0);
+            const distance = Cesium.Plane.getPointDistance(
+              originCenteredPlane,
+              midpoint,
+            );
+            planes.push(new Cesium.ClippingPlane(normal, distance));
+          }
+
+          this.viewer.scene.globe.clippingPlanes =
+            new Cesium.ClippingPlaneCollection({
+              planes: planes,
+              edgeWidth: this.edgeWidth,
+              edgeColor: this.edgeColor,
+            });
+        }
+
+        /** 裁剪多边形方案（Cesium 1.111+）：支持任意凹多边形 */
+        applyClippingPolygons() {
+          const positions = this.lonLats.map((p) =>
+            Cesium.Cartesian3.fromDegrees(p.x, p.y),
+          );
+          this.viewer.scene.globe.clippingPolygons =
+            new Cesium.ClippingPolygonCollection({
+              polygons: [new Cesium.ClippingPolygon({ positions: positions })],
+            });
+        }
+
+        clearClipping() {
+          const globe = this.viewer.scene.globe;
+          if (globe.clippingPlanes) globe.clippingPlanes = undefined;
+          if (globe.clippingPolygons) globe.clippingPolygons = undefined;
+        }
+
+        setClippingEnabled(enabled) {
+          const globe = this.viewer.scene.globe;
+          if (globe.clippingPlanes) globe.clippingPlanes.enabled = enabled;
+          if (globe.clippingPolygons) globe.clippingPolygons.enabled = enabled;
+        }
+
+        setEdgeStyle(color, width) {
+          this.edgeColor = color;
+          this.edgeWidth = width;
+          const planes = this.viewer.scene.globe.clippingPlanes;
+          if (planes) {
+            planes.edgeColor = color;
+            planes.edgeWidth = width;
+          }
+        }
+
+        // ---------- 开挖面与侧壁 ----------
+
+        createBottom() {
+          const nar = [];
+          this.lonLats.forEach((p) => nar.push(p.x, p.y));
+
+          this.bottomEntity = this.viewer.entities.add({
+            id: "excavation-bottom",
+            polygon: {
+              hierarchy: Cesium.Cartesian3.fromDegreesArray(nar),
+              material: this.bottomMaterial,
+              // 静态高程。用 CallbackProperty 会让 Cesium 判定实体为动态几何体，
+              // 每帧重建 PolygonGeometry —— 这是拖动卡顿的主因。
+              height: this.baseHeight,
+            },
+          });
+        }
+
+        createWall() {
+          this.wallEntity = this.viewer.entities.add({
+            id: "excavation-wall",
+            wall: {
+              positions: Cesium.Cartesian3.fromDegreesArray(this.wallDegrees),
+              // 同上：静态数组。CallbackProperty 会导致每帧重建 WallGeometry，
+              // 251 个顶点的三角化 + GPU 上传，帧率直接崩掉。
+              maximumHeights: this.topHeights,
+              minimumHeights: this.minHeights,
+              material: this.sideMaterial,
+            },
+          });
+        }
+
+        /**
+         * 把最新高程推给实体。赋新数组会触发 definitionChanged，
+         * Cesium 重建一次几何体 —— 只在深度变化或地形同步时发生，
+         * 而不是每帧。
+         */
+        applyHeights() {
+          if (this.bottomEntity) {
+            this.bottomEntity.polygon.height = this.baseHeight;
+          }
+          if (this.wallEntity) {
+            this.wallEntity.wall.maximumHeights = this.topHeights;
+            this.wallEntity.wall.minimumHeights = this.minHeights;
+          }
+        }
+
+        setMaterials(bottomMaterial, sideMaterial) {
+          this.bottomMaterial = bottomMaterial;
+          this.sideMaterial = sideMaterial;
+          if (this.bottomEntity) this.bottomEntity.polygon.material = bottomMaterial;
+          if (this.wallEntity) this.wallEntity.wall.material = sideMaterial;
+        }
+
+        setShow(showBottom, showWall) {
+          if (this.bottomEntity) this.bottomEntity.show = showBottom;
+          if (this.wallEntity) this.wallEntity.show = showWall;
+        }
+
+        destroy() {
+          this.stopTerrainSync();
+          this.clearClipping();
+          if (this.bottomEntity) {
+            this.viewer.entities.remove(this.bottomEntity);
+            this.bottomEntity = null;
+          }
+          if (this.wallEntity) {
+            this.viewer.entities.remove(this.wallEntity);
+            this.wallEntity = null;
+          }
+        }
+
+        // ---------- 工具 ----------
+
+        /** 判断多边形顶点顺序是否为顺时针（取最南点前后两边做叉积） */
+        static isClockWise(lonLats) {
+          if (lonLats.length < 3) return null;
+          let arr = lonLats;
+          if (arr[0] === arr[arr.length - 1]) arr = arr.slice(0, -1);
+
+          let minIndex = 0;
+          let minLat = Number.POSITIVE_INFINITY;
+          for (let i = 0; i < arr.length; i++) {
+            if (arr[i].y < minLat) {
+              minLat = arr[i].y;
+              minIndex = i;
+            }
+          }
+          const i1 = (minIndex + arr.length - 1) % arr.length;
+          const i2 = minIndex;
+          const i3 = (minIndex + 1) % arr.length;
+
+          const v21 = { x: arr[i2].x - arr[i1].x, y: arr[i2].y - arr[i1].y };
+          const v32 = { x: arr[i3].x - arr[i2].x, y: arr[i3].y - arr[i2].y };
+          const result = v32.x * v21.y - v21.x * v32.y;
+          return result === 0 ? arr[i3].x < arr[i1].x : result > 0;
+        }
+
+        /** 多边形近似面积（平方米），仅用于面板展示 */
+        static area(lonLats) {
+          if (lonLats.length < 3) return 0;
+          const latRad = Cesium.Math.toRadians(lonLats[0].y);
+          const mx = 111320 * Math.cos(latRad);
+          const my = 110540;
+          let sum = 0;
+          for (let i = 0; i < lonLats.length; i++) {
+            const a = lonLats[i];
+            const b = lonLats[(i + 1) % lonLats.length];
+            sum += a.x * mx * (b.y * my) - b.x * mx * (a.y * my);
+          }
+          return Math.abs(sum) / 2;
+        }
+      }
+
+      // ============================================================
+      // Vue 应用
+      // ============================================================
+      createApp({
+        data() {
+          return {
+            viewer: null,
+            imageryLayer: null,
+            excavation: null,
+            terrainReady: false,
+
+            // 绘制状态
+            drawHandler: null,
+            drawing: false,
+            drawPositions: [], // Cartesian3[]
+            movingPosition: null,
+            drawLineEntity: null,
+            drawPolygonEntity: null,
+            drawPointEntities: [],
+
+            // 纹理（只生成一次，反复复用）
+            gravelCanvas: null,
+            strataCanvas: null,
+
+            statusText: "点击「绘制开挖范围」→ 左键逐点取点，右键结束。",
+
+            params: {
+              depth: 80,
+              splitNum: 50,
+              topOffset: 1,
+              clipMode: "planes",
+              autoExcavate: true,
+              textureMode: "procedural", // procedural | url | none
+              sideImage: "",
+              bottomImage: "",
+              tileSize: 20, // 一块贴图代表多少米
+              bottomColor: "#cbc6c2",
+              sideColor: "#ffffff",
+              showBottom: true,
+              showWall: true,
+              clipEnabled: true,
+              edgeColor: "#808000",
+              edgeWidth: 1.0,
+              depthTest: true,
+            },
+          };
+        },
+
+        async mounted() {
+          this.gravelCanvas = makeGravelTexture();
+          this.strataCanvas = makeStrataTexture();
+          this.initMap();
+          this.addlilgui();
+        },
+
+        beforeUnmount() {
+          this.cancelDraw();
+          if (this.excavation) this.excavation.destroy();
+          if (this.myLilGui) {
+            this.myLilGui.destroy();
+            this.myLilGui = null;
+          }
+        },
+
+        methods: {
+          initMap() {
+            let viewer = new Cesium.Viewer("cesiumContainer", {
+              baseLayer: false,
+              animation: false,
+              timeline: false,
+              fullscreenButton: false,
+              infoBox: false,
+              geocoder: false,
+              homeButton: false,
+              sceneModePicker: false,
+              baseLayerPicker: false,
+              navigationHelpButton: false,
+              selectionIndicator: false,
+              shouldAnimate: true,
+            });
+
+            window.viewer = viewer;
+            this.viewer = viewer;
+            viewer.scene.debugShowFramesPerSecond = true;
+            viewer.scene.globe.enableLighting = false;
+            viewer.scene.fog.enabled = true;
+            viewer.scene.fog.density = 0.00008;
+            viewer.scene.skyAtmosphere.show = true;
+            viewer._cesiumWidget._creditContainer.style.display = "none";
+
+            // 开挖依赖真实地形
+            Cesium.ArcGISTiledElevationTerrainProvider.fromUrl(
+              "https://elevation3d.arcgis.com/arcgis/rest/services/WorldElevation3D/Terrain3D/ImageServer",
+            )
+              .then((provider) => {
+                viewer.terrainProvider = provider;
+                this.terrainReady = true;
+                this.statusText =
+                  "地形加载完成。\n点击「绘制开挖范围」→ 左键逐点取点，右键结束。";
+              })
+              .catch((error) => {
+                console.warn("地形加载失败", error);
+                this.statusText = "地形加载失败，将在椭球面上演示。";
+              });
+
+            // 裁剪面与开挖体必须开启地形深度检测才能正确遮挡
+            viewer.scene.globe.depthTestAgainstTerrain = true;
+
+            this.imageryLayer = viewer.imageryLayers.addImageryProvider(
+              new Cesium.UrlTemplateImageryProvider({
+                url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                maximumLevel: 18,
+              }),
+            );
+
+            this.resetCamera();
+          },
+
+          addlilgui() {
+            let myLilGui = new GUI({ title: "地形开挖" });
+            this.myLilGui = myLilGui;
+
+            // ---- 绘制 ----
+            let drawFolder = myLilGui.addFolder("绘制区域");
+            drawFolder
+              .add({ draw: () => this.startDraw() }, "draw")
+              .name("绘制开挖范围");
+            drawFolder.add(this.params, "autoExcavate").name("绘制完成自动开挖");
+            drawFolder
+              .add({ run: () => this.runExcavate() }, "run")
+              .name("重新开挖");
+            drawFolder
+              .add({ clear: () => this.clearAll() }, "clear")
+              .name("清除");
+
+            // ---- 开挖参数 ----
+            let paramFolder = myLilGui.addFolder("开挖参数");
+            paramFolder
+              .add(this.params, "depth", 1, 500, 1)
+              .name("开挖深度 (m)")
+              .onChange(() => this.onDepthChange());
+            paramFolder
+              .add(this.params, "topOffset", 0, 10, 0.5)
+              .name("侧壁顶抬高 (m)")
+              .onChange(() => this.onDepthChange());
+            paramFolder
+              .add(this.params, "splitNum", 8, 200, 1)
+              .name("边界采样密度")
+              .onChange(() => this.runExcavate());
+            paramFolder
+              .add(this.params, "clipMode", {
+                "裁剪面(凸多边形)": "planes",
+                "裁剪多边形(任意)": "polygons",
+              })
+              .name("裁剪方式")
+              .onChange(() => this.runExcavate());
+
+            // ---- 外观 ----
+            let styleFolder = myLilGui.addFolder("开挖体外观");
+            styleFolder
+              .add(this.params, "textureMode", {
+                程序化纹理: "procedural",
+                "自定义图片 (URL)": "url",
+                纯色: "none",
+              })
+              .name("贴图来源")
+              .onChange(() => this.applyMaterials());
+            styleFolder
+              .add(this.params, "sideImage")
+              .name("侧壁图片 URL")
+              .onFinishChange(() => this.applyMaterials());
+            styleFolder
+              .add(this.params, "bottomImage")
+              .name("底面图片 URL")
+              .onFinishChange(() => this.applyMaterials());
+            styleFolder
+              .add(this.params, "tileSize", 1, 200, 1)
+              .name("贴图尺寸 (m/块)")
+              .onChange(() => this.updateRepeat());
+            styleFolder
+              .addColor(this.params, "bottomColor")
+              .name("底面颜色")
+              .onChange(() => this.applyMaterials());
+            styleFolder
+              .addColor(this.params, "sideColor")
+              .name("侧壁颜色")
+              .onChange(() => this.applyMaterials());
+            styleFolder
+              .add(this.params, "showBottom")
+              .name("显示底面")
+              .onChange(() => this.applyShow());
+            styleFolder
+              .add(this.params, "showWall")
+              .name("显示侧壁")
+              .onChange(() => this.applyShow());
+
+            // ---- 裁剪边缘 ----
+            let edgeFolder = myLilGui.addFolder("裁剪边缘");
+            edgeFolder
+              .add(this.params, "clipEnabled")
+              .name("启用地形裁剪")
+              .onChange((value) => {
+                if (this.excavation) this.excavation.setClippingEnabled(value);
+              });
+            edgeFolder
+              .addColor(this.params, "edgeColor")
+              .name("边缘高亮色")
+              .onChange(() => this.applyEdgeStyle());
+            edgeFolder
+              .add(this.params, "edgeWidth", 0, 10, 0.5)
+              .name("边缘宽度")
+              .onChange(() => this.applyEdgeStyle());
+
+            // ---- 视图 ----
+            let viewFolder = myLilGui.addFolder("视图");
+            viewFolder
+              .add(this.params, "depthTest")
+              .name("地形深度检测")
+              .onChange((value) => {
+                this.viewer.scene.globe.depthTestAgainstTerrain = value;
+              });
+            viewFolder
+              .add({ fly: () => this.resetCamera() }, "fly")
+              .name("重置视角");
+            viewFolder
+              .add({ fly: () => this.flyToExcavation() }, "fly")
+              .name("飞向开挖区");
+          },
+
+          // ============================================================
+          // 多边形绘制：左键加点，右键结束
+          // ============================================================
+
+          startDraw() {
+            this.clearAll();
+            this.drawing = true;
+            this.drawPositions = [];
+            this.movingPosition = null;
+            this.statusText = "左键逐点取点（≥3 个），右键结束绘制。";
+
+            // 屏蔽默认双击追踪
+            this.viewer.cesiumWidget.screenSpaceEventHandler.removeInputAction(
+              Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK,
+            );
+
+            const handler = new Cesium.ScreenSpaceEventHandler(
+              this.viewer.scene.canvas,
+            );
+            this.drawHandler = handler;
+            this.createDrawPreview();
+
+            handler.setInputAction((click) => {
+              const cartesian = this.pickGlobe(click.position);
+              if (!cartesian) return;
+              this.drawPositions.push(cartesian);
+              this.drawPointEntities.push(
+                this.viewer.entities.add({
+                  position: cartesian,
+                  point: {
+                    pixelSize: 8,
+                    color: Cesium.Color.CYAN,
+                    outlineColor: Cesium.Color.WHITE,
+                    outlineWidth: 1,
+                    disableDepthTestDistance: Number.POSITIVE_INFINITY,
+                  },
+                }),
+              );
+              this.statusText = `已取 ${this.drawPositions.length} 个点，右键结束绘制。`;
+            }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+
+            handler.setInputAction((movement) => {
+              const cartesian = this.pickGlobe(movement.endPosition);
+              if (cartesian) this.movingPosition = cartesian;
+            }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+
+            handler.setInputAction(() => {
+              if (this.drawPositions.length < 3) {
+                this.statusText = "至少需要 3 个点，请继续取点。";
+                return;
+              }
+              this.finishDraw();
+            }, Cesium.ScreenSpaceEventType.RIGHT_CLICK);
+          },
+
+          finishDraw() {
+            this.cancelDraw();
+            this.movingPosition = null;
+            this.statusText = `范围绘制完成，共 ${this.drawPositions.length} 个顶点。`;
+            this.freezeDrawPreview();
+            if (this.params.autoExcavate) this.runExcavate();
+          },
+
+          freezeDrawPreview() {
+            const ring = this.drawPositions.slice();
+            if (ring.length > 2) ring.push(ring[0]);
+            if (this.drawLineEntity) {
+              this.drawLineEntity.polyline.positions = ring;
+            }
+            if (this.drawPolygonEntity && this.drawPositions.length > 2) {
+              this.drawPolygonEntity.polygon.hierarchy =
+                new Cesium.PolygonHierarchy(this.drawPositions.slice());
+            }
+          },
+
+          cancelDraw() {
+            this.drawing = false;
+            if (this.drawHandler) {
+              this.drawHandler.destroy();
+              this.drawHandler = null;
+            }
+          },
+
+          pickGlobe(windowPosition) {
+            const ray = this.viewer.camera.getPickRay(windowPosition);
+            if (!ray) return null;
+            return this.viewer.scene.globe.pick(ray, this.viewer.scene);
+          },
+
+          /** 绘制过程中的动态轮廓线与填充面 */
+          createDrawPreview() {
+            this.drawLineEntity = this.viewer.entities.add({
+              polyline: {
+                positions: new Cesium.CallbackProperty(() => {
+                  const positions = this.drawPositions.slice();
+                  if (this.drawing && this.movingPosition) {
+                    positions.push(this.movingPosition);
+                  }
+                  if (positions.length > 2) positions.push(positions[0]);
+                  return positions.length > 1 ? positions : [];
+                }, false),
+                width: 2,
+                clampToGround: true,
+                material: Cesium.Color.CYAN,
+              },
+            });
+
+            this.drawPolygonEntity = this.viewer.entities.add({
+              polygon: {
+                hierarchy: new Cesium.CallbackProperty(() => {
+                  const positions = this.drawPositions.slice();
+                  if (this.drawing && this.movingPosition) {
+                    positions.push(this.movingPosition);
+                  }
+                  return positions.length > 2
+                    ? new Cesium.PolygonHierarchy(positions)
+                    : undefined;
+                }, false),
+                material: Cesium.Color.CYAN.withAlpha(0.15),
+                classificationType: Cesium.ClassificationType.TERRAIN,
+              },
+            });
+          },
+
+          removeDrawPreview() {
+            if (this.drawLineEntity) {
+              this.viewer.entities.remove(this.drawLineEntity);
+              this.drawLineEntity = null;
+            }
+            if (this.drawPolygonEntity) {
+              this.viewer.entities.remove(this.drawPolygonEntity);
+              this.drawPolygonEntity = null;
+            }
+            this.drawPointEntities.forEach((entity) =>
+              this.viewer.entities.remove(entity),
+            );
+            this.drawPointEntities = [];
+          },
+
+          // ============================================================
+          // 开挖
+          // ============================================================
+
+          async runExcavate() {
+            if (this.drawPositions.length < 3) {
+              this.statusText = "请先绘制开挖范围（至少 3 个点）。";
+              return;
+            }
+            // 开挖体建成后隐藏绘制辅助图形，避免遮挡
+            this.removeDrawPreview();
+            this.statusText = "正在采样地形高程…";
+
+            if (!this.excavation) {
+              this.excavation = new TerrainExcavation({
+                viewer: this.viewer,
+                onSync: () => {
+                  this.updateStatus();
+                  this.updateRepeat();
+                },
+              });
+            }
+            this.excavation.depth = this.params.depth;
+            this.excavation.splitNum = this.params.splitNum;
+            this.excavation.topOffset = this.params.topOffset;
+            this.excavation.clipMode = this.params.clipMode;
+            this.excavation.edgeColor = Cesium.Color.fromCssColorString(
+              this.params.edgeColor,
+            );
+            this.excavation.edgeWidth = this.params.edgeWidth;
+            this.excavation.bottomMaterial = this.buildMaterial("bottom");
+            this.excavation.sideMaterial = this.buildMaterial("side");
+
+            await this.excavation.excavate(this.drawPositions);
+
+            this.excavation.setClippingEnabled(this.params.clipEnabled);
+            this.applyShow();
+            this.updateStatus();
+          },
+
+          onDepthChange() {
+            if (!this.excavation || !this.excavation.bottomEntity) return;
+            this.excavation.depth = this.params.depth;
+            this.excavation.topOffset = this.params.topOffset;
+            this.excavation.refreshHeights();
+            this.updateRepeat();
+            this.updateStatus();
+          },
+
+          buildMaterial(type) {
+            const isBottom = type === "bottom";
+            const color = Cesium.Color.fromCssColorString(
+              isBottom ? this.params.bottomColor : this.params.sideColor,
+            );
+            if (this.params.textureMode === "none") {
+              return new Cesium.ColorMaterialProperty(color);
+            }
+            return new Cesium.ImageMaterialProperty({
+              image: this.resolveImage(isBottom),
+              color: color,
+              repeat: this.computeRepeat(isBottom),
+            });
+          },
+
+          /** 自定义 URL 为空时回退到程序化纹理，避免出现黑面 */
+          resolveImage(isBottom) {
+            const fallback = isBottom ? this.gravelCanvas : this.strataCanvas;
+            if (this.params.textureMode !== "url") return fallback;
+            const url = (
+              isBottom ? this.params.bottomImage : this.params.sideImage
+            ).trim();
+            return url || fallback;
+          },
+
+          /**
+           * 把「一块贴图 = tileSize 米」换算成 Cesium 的 repeat。
+           * 侧壁：s 沿周长、t 沿墙高；底面：按包围盒的东西/南北跨度。
+           */
+          computeRepeat(isBottom) {
+            const tile = Math.max(1, this.params.tileSize);
+            const excavation = this.excavation;
+            if (!excavation || !excavation.perimeter) {
+              return new Cesium.Cartesian2(1, 1);
+            }
+            const spanX = isBottom
+              ? excavation.bboxWidth
+              : excavation.perimeter;
+            const spanY = isBottom
+              ? excavation.bboxHeight
+              : excavation.averageWallHeight;
+            return new Cesium.Cartesian2(
+              Math.max(1, spanX / tile),
+              Math.max(1, spanY / tile),
+            );
+          },
+
+          /** 参数变化时手动刷新材质的 repeat，替代每帧轮询的 CallbackProperty */
+          updateRepeat() {
+            if (!this.excavation) return;
+            const bottom = this.excavation.bottomEntity;
+            const wall = this.excavation.wallEntity;
+            if (bottom && bottom.polygon.material) {
+              bottom.polygon.material.repeat = this.computeRepeat(true);
+            }
+            if (wall && wall.wall.material) {
+              wall.wall.material.repeat = this.computeRepeat(false);
+            }
+          },
+
+          applyMaterials() {
+            if (!this.excavation) return;
+            this.excavation.setMaterials(
+              this.buildMaterial("bottom"),
+              this.buildMaterial("side"),
+            );
+          },
+
+          applyShow() {
+            if (!this.excavation) return;
+            this.excavation.setShow(
+              this.params.showBottom,
+              this.params.showWall,
+            );
+          },
+
+          applyEdgeStyle() {
+            if (!this.excavation) return;
+            this.excavation.setEdgeStyle(
+              Cesium.Color.fromCssColorString(this.params.edgeColor),
+              this.params.edgeWidth,
+            );
+          },
+
+          updateStatus() {
+            const excavation = this.excavation;
+            if (!excavation || !excavation.lonLats.length) return;
+            const area = TerrainExcavation.area(excavation.lonLats);
+            this.statusText = [
+              `顶点数：${excavation.lonLats.length}　投影面积：${(area / 10000).toFixed(2)} 公顷`,
+              `地形高程：${excavation.minTerrainHeight.toFixed(1)} ~ ${excavation.maxTerrainHeight.toFixed(1)} m`,
+              `开挖深度：${this.params.depth} m　开挖面高程：${excavation.baseHeight.toFixed(1)} m`,
+              `侧壁周长：${excavation.perimeter.toFixed(0)} m　平均墙高：${excavation.averageWallHeight.toFixed(1)} m`,
+              `精细面/渲染面最大高差：${excavation.lodDelta.toFixed(1)} m（墙顶已贴渲染面）`,
+              `裁剪方式：${this.params.clipMode === "planes" ? "ClippingPlanes（凸多边形）" : "ClippingPolygons（任意多边形）"}`,
+            ].join("\n");
+          },
+
+          clearAll() {
+            this.cancelDraw();
+            this.removeDrawPreview();
+            this.drawPositions = [];
+            this.movingPosition = null;
+            if (this.excavation) {
+              this.excavation.destroy();
+              this.excavation = null;
+            }
+            this.statusText =
+              "已清除。点击「绘制开挖范围」→ 左键逐点取点，右键结束。";
+          },
+
+          // ============================================================
+          // 相机
+          // ============================================================
+
+          resetCamera() {
+            if (!this.viewer) return;
+            this.viewer.camera.setView({
+              destination: Cesium.Cartesian3.fromDegrees(102.2, 29.58, 6000),
+              orientation: {
+                heading: Cesium.Math.toRadians(0),
+                pitch: Cesium.Math.toRadians(-35),
+                roll: 0,
+              },
+            });
+          },
+
+          flyToExcavation() {
+            if (!this.excavation || !this.excavation.wallEntity) {
+              this.statusText = "尚未生成开挖体。";
+              return;
+            }
+            this.viewer.flyTo(this.excavation.wallEntity, {
+              offset: new Cesium.HeadingPitchRange(
+                0,
+                Cesium.Math.toRadians(-40),
+                600,
+              ),
+            });
+          },
+        },
+      }).mount("#app");
+    </script>
+  </body>
+</html>
