@@ -1,0 +1,1651 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TransformHelper</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Cesium.js"></script>
+    <link
+      href="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Widgets/widgets.css"
+      rel="stylesheet"
+    />
+    <style>
+      html,
+      body,
+      #app,
+      #cesiumContainer {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #000;
+      }
+
+      .status-panel {
+        position: absolute;
+        left: 10px;
+        bottom: 10px;
+        z-index: 998;
+        max-width: 460px;
+        padding: 8px 12px;
+        border-radius: 6px;
+        color: #e8f1ff;
+        background: rgba(12, 18, 28, 0.78);
+        font-size: 13px;
+        line-height: 1.7;
+        pointer-events: none;
+      }
+
+      .status-panel .tip {
+        color: #7fd4ff;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="cesiumContainer"></div>
+      <div class="status-panel">
+        <span class="tip">提示：</span>{{ statusText }}
+      </div>
+    </div>
+
+    <script type="module">
+      const { createApp } = Vue;
+
+      // ============================================================
+      // 为模型提供移动 / 旋转 / 缩放的可视化控制
+      // ============================================================
+
+
+class AxisPlaneGeometry {
+  constructor(options = {}) {
+    this._normal = options.normal;
+    this._radius = options.radius;
+    this._center = options.center;
+    const vertexFormat = defaultValue(
+      options.vertexFormat,
+      Cesium.VertexFormat.DEFAULT
+    );
+    this._vertexFormat = vertexFormat;
+  }
+  static createGeometry(planeGeometry) {
+    const v1 = Math.max(1, planeGeometry._radius * 0.02);
+    const v2 = Math.max(planeGeometry._radius * 0.2, v1 * 2);
+    let positions = [];
+    let normal = [];
+    const { x, y, z } = planeGeometry._center;
+    let center;
+    if (Cesium.Cartesian3.equals(planeGeometry._normal, Cesium.Cartesian3.UNIT_X)) {
+      positions = [
+        x,
+        -v1 + y,
+        v1 + z,
+        x,
+        -v2 + y,
+        v1 + z,
+        x,
+        -v2 + y,
+        v2 + z,
+        x,
+        -v1 + y,
+        v2 + z,
+      ];
+      center = new Cesium.Cartesian3(x, -(v1 + v2) / 2 + y, (v1 + v2) / 2 + z);
+      normal = [1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0];
+    } else if (
+      Cesium.Cartesian3.equals(planeGeometry._normal, Cesium.Cartesian3.UNIT_Y)
+    ) {
+      positions = [
+        v1 + x,
+        y,
+        v1 + z,
+        v2 + x,
+        y,
+        v1 + z,
+        v2 + x,
+        y,
+        v2 + z,
+        v1 + x,
+        y,
+        v2 + z,
+      ];
+      center = new Cesium.Cartesian3((v1 + v2) / 2 + x, y, (v1 + v2) / 2 + z);
+      normal = [0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0];
+    } else if (
+      Cesium.Cartesian3.equals(planeGeometry._normal, Cesium.Cartesian3.UNIT_Z)
+    ) {
+      positions = [
+        v1 + x,
+        -v1 + y,
+        z,
+        v2 + x,
+        -v1 + y,
+        z,
+        v2 + x,
+        -v2 + y,
+        z,
+        v1 + x,
+        -v2 + y,
+        z,
+      ];
+      center = new Cesium.Cartesian3((v1 + v2) / 2 + x, -(v1 + v2) / 2 + y, z);
+      normal = [0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1];
+    }
+    positions = new Float32Array([...positions]);
+    const sts = new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]);
+    const indices = new Uint16Array([0, 1, 2, 2, 3, 0]);
+    return new Cesium.Geometry({
+      attributes: new Cesium.GeometryAttributes({
+        position: new Cesium.GeometryAttribute({
+          componentDatatype: Cesium.ComponentDatatype.DOUBLE,
+          componentsPerAttribute: 3,
+          values: positions,
+        }),
+        normal: new Cesium.GeometryAttribute({
+          componentDatatype: Cesium.ComponentDatatype.FLOAT,
+          componentsPerAttribute: 3,
+          values: normal,
+        }),
+        st: new Cesium.GeometryAttribute({
+          componentDatatype: Cesium.ComponentDatatype.FLOAT,
+          componentsPerAttribute: 2,
+          values: sts,
+        }),
+      }),
+      indices: indices,
+      primitiveType: Cesium.PrimitiveType.TRIANGLES,
+      boundingSphere: new Cesium.BoundingSphere(center, (v1 + v2) / 2),
+    });
+  }
+}
+class AxisPlane {
+  /**
+   * 坐标轴平面
+   * @private
+   * @param {*} options
+   */
+  constructor(options = {}) {
+    this._center = options.center;
+    this._modelMatrix = options.modelMatrix;
+    this._color = options.color;
+    const radius = options.radius;
+    this._normal = options.normal;
+    const planeGeometry = new AxisPlaneGeometry({
+      normal: this._normal,
+      radius: radius,
+      vertexFormat: Cesium.VertexFormat.DEFAULT,
+      center: this._center,
+    });
+    const instance = new Cesium.GeometryInstance({
+      geometry: AxisPlaneGeometry.createGeometry(planeGeometry),
+    });
+    const primitive = new Cesium.Primitive({
+      asynchronous: false,
+      geometryInstances: instance,
+      modelMatrix: this._modelMatrix,
+      appearance: new Cesium.MaterialAppearance({
+        material: Cesium.Material.fromType("Cesium.Color", {
+          color: this._color,
+        }),
+      }),
+    });
+    primitive.isAxisPlane = true;
+    primitive.normal = this._normal;
+    primitive.axis = options.axis;
+    primitive.color = this._color;
+    return primitive;
+  }
+}
+
+
+function defaultValue(a, b) {
+  if (a !== undefined && a !== null) {
+    return a;
+  }
+  return b;
+}
+
+/**
+ * 判断一个变量是否被定义
+ * @param value
+ * @exports defined
+ * @returns {Boolean} value是否被定义
+ */
+function defined(value) {
+  return value !== undefined && value !== null;
+}
+
+class LonLat {
+  /**
+   * 用经纬度（度）和海拔（米）描述一个地理位置。
+   * @param {Number} lon 经度，单位：度
+   * @param {Number} lat 经度，单位：度
+   * @param {Number} alt 海拔，单位：米
+   */
+  constructor(lon, lat, alt) {
+    if (!defined(lon)) {
+      console.warn("longitude is required.");
+    }
+    if (!defined(lat)) {
+      console.warn("latitude is required.");
+    }
+    this.lon = lon;
+    this.lat = lat;
+    this.alt = defaultValue(alt, 0);
+  }
+  /**
+   * 转屏幕坐标
+   * @param {LonLat|Cesium.Cartesian3|Cesium.Cartographic} point
+   * @param {Cesium.Scene} scene
+   * @returns 对应的屏幕坐标
+   */
+  static toPixel(point, scene) {
+    
+    if (!defined(scene)) {
+      console.warn("scene未定义。");
+    }
+    
+    if (!defined(point)) {
+      return undefined;
+    }
+    const cartesian = LonLat.toCartesian(point);
+    if (!defined(cartesian)) {
+      return undefined;
+    }
+    return Cesium.SceneTransforms.worldToWindowCoordinates(scene, cartesian);
+  }
+  /**
+   * 转笛卡尔坐标
+   * @param {LonLat|Cesium.Cartesian3|Cesium.Cartographic|Cesium.Cartesian2} point
+   * @param {Viewer} [viewer] viewer对象， 如果point是Cesium.Cartesian2类型，该参数需要被提供
+   * @returns 用笛卡尔坐标表示的点
+   */
+  static toCartesian(point, viewer) {
+    
+    if (!defined(point)) {
+      return undefined;
+    }
+    
+    if (point instanceof Cesium.Cartesian3) {
+      return point;
+    }
+    if (point instanceof Cesium.Cartographic) {
+      return Cesium.Cartographic.toCartesian(point);
+    }
+    if (point instanceof LonLat) {
+      return Cesium.Cartesian3.fromDegrees(point.lon, point.lat, point.alt);
+    }
+    if (point instanceof Cesium.Cartesian2) {
+      if (!viewer) {
+        return;
+      }
+      const ray = viewer.scene.camera.getPickRay(point);
+      return viewer.scene.globe.pick(ray, viewer.scene);
+    }
+  }
+  /**
+   * 从一个笛卡尔坐标创建点
+   * @param {Cesium.Cartesian3} cartesian 笛卡尔坐标点
+   * @returns GeoPoint点
+   */
+  static fromCartesian(cartesian) {
+    
+    if (!defined(cartesian)) {
+      return undefined;
+    }
+    
+    const cartographic = Cesium.Cartographic.fromCartesian(cartesian);
+    if (!defined(cartographic)) {
+      return undefined;
+    }
+    return LonLat.fromCartographic(cartographic);
+  }
+  /**
+   * 从一个地理坐标点创建点
+   * @param {Cesium.Cartographic} cartographic 地理坐标点
+   * @returns GeoPoint点
+   */
+  static fromCartographic(cartographic) {
+    
+    if (!defined(cartographic)) {
+      console.warn("cartographic is not defined.");
+    }
+    
+    return new LonLat(
+      Cesium.Math.toDegrees(cartographic.longitude),
+      Cesium.Math.toDegrees(cartographic.latitude),
+      cartographic.height
+    );
+  }
+  /**
+   * 从一个窗口坐标创建点
+   * @param {Cesium.Cartesian2} pixel 窗口坐标
+   * @param {Cesium.Viewer} viewer Viewer对象
+   * @returns {LonLat} GeoPoint点
+   */
+  static fromPixel(pixel, viewer) {
+    if (!viewer.scene.globe) {
+      return undefined;
+    }
+    
+    if (!defined(pixel)) {
+      console.warn("pixel is not defined.");
+    }
+    if (viewer instanceof Cesium.Viewer === false) {
+      console.warn("viewer不是一个有效的Cesium.Viewer对象");
+    }
+    
+    const ray = viewer.scene.camera.getPickRay(pixel);
+    const cartesian = viewer.scene.globe.pick(ray, viewer.scene);
+    if (!defined(cartesian)) {
+      return undefined;
+    }
+    return LonLat.fromCartesian(cartesian);
+  }
+}
+
+const polylineAntialiasingMaterial = `#ifdef GL_OES_standard_derivatives
+#extension GL_OES_standard_derivatives : enable
+#endif
+uniform vec4 color;
+uniform vec4 gapColor;
+uniform float dashLength;
+uniform float dashPattern;
+in float v_polylineAngle;
+
+const float maskLength = 16.0;
+
+mat2 rotate(float rad) {
+    float c = cos(rad);
+    float s = sin(rad);
+    return mat2(
+        c, s,
+        -s, c
+    );
+}
+
+float getPointOnLine(vec2 p0, vec2 p1, float x)
+{
+    float slope = (p0.y - p1.y) / (p0.x - p1.x);
+    return slope * (x - p0.x) + p0.y;
+}
+
+czm_material czm_getMaterial(czm_materialInput materialInput)
+{
+    czm_material material = czm_getDefaultMaterial(materialInput);
+
+    vec2 st = materialInput.st;
+
+#ifdef GL_OES_standard_derivatives
+    float base = 1.0 - abs(fwidth(st.s)) * 10.0 * czm_pixelRatio;
+#else
+    float base = 0.975; // 2.5% of the line will be the arrow head
+#endif
+    // 没有箭头
+    base = 1.0;
+
+    vec2 center = vec2(1.0, 0.5);
+    float ptOnUpperLine = getPointOnLine(vec2(base, 1.0), center, st.s);
+    float ptOnLowerLine = getPointOnLine(vec2(base, 0.0), center, st.s);
+
+    float halfWidth = 0.15;
+    float s = step(0.5 - halfWidth, st.t);
+    s *= 1.0 - step(0.5 + halfWidth, st.t);
+    s *= 1.0 - step(base, st.s);
+
+    float t = step(base, materialInput.st.s);
+    t *= 1.0 - step(ptOnUpperLine, st.t);
+    t *= step(ptOnLowerLine, st.t);
+
+    // Find the distance from the closest separator (region between two colors)
+    float dist;
+    if (st.s < base)
+    {
+        float d1 = abs(st.t - (0.5 - halfWidth));
+        float d2 = abs(st.t - (0.5 + halfWidth));
+        dist = min(d1, d2);
+    }
+    else
+    {
+        float d1 = czm_infinity;
+        if (st.t < 0.5 - halfWidth && st.t > 0.5 + halfWidth)
+        {
+            d1 = abs(st.s - base);
+        }
+        float d2 = abs(st.t - ptOnUpperLine);
+        float d3 = abs(st.t - ptOnLowerLine);
+        dist = min(min(d1, d2), d3);
+    }
+
+    vec4 outsideColor = vec4(0.0);
+    vec4 currentColor = mix(outsideColor, color, clamp(s + t, 0.0, 1.0));
+    vec4 outColor = czm_antialias(outsideColor, color, currentColor, dist);
+    // dash
+    vec2 pos = rotate(v_polylineAngle) * gl_FragCoord.xy;
+    // Get the relative position within the dash from 0 to 1
+    float dashPosition = fract(pos.x / (dashLength * czm_pixelRatio));
+    // Figure out the mask index.
+    float maskIndex = floor(dashPosition * maskLength);
+    // Test the bit mask.
+    float maskTest = floor(dashPattern / pow(2.0, maskIndex));
+    vec4 fragColor = (mod(maskTest, 2.0) < 1.0) ? gapColor : color;
+    if (fragColor.a < 0.005) {   // matches 0/255 and 1/255
+        discard;
+    }
+    outColor *= fragColor;
+    outColor = czm_gammaCorrect(outColor);
+    material.diffuse = outColor.rgb;
+    material.alpha = outColor.a;
+    return material;
+}
+`;
+
+/* eslint-disable prefer-rest-params */
+
+function compareNumber(a, b) {
+  return b - a;
+}
+class Event {
+  /**
+   * 事件管理器
+   * @example
+   * const addMarkerEvent=new Event();
+   * function saveMark(marker){
+   *  console.log("添加了一个marker",marker.id)
+   * }
+   * addMarkerEvent.on(saveMark)
+   * const mark=viewer.entities.add({
+   *  id:"mark1",
+   *  billboard:{
+   *    image:"./icon/pin.png"
+   *  }
+   * })
+   * addMarkerEvent.emit(mark)
+   */
+  constructor() {
+    this._listeners = [];
+    this._scopes = [];
+    this._toRemove = [];
+    this._insideRaiseEvent = false;
+  }
+
+  /**
+   * 当前订阅事件的侦听器个数
+   * @type {Number}
+   */
+  get numberOfListeners() {
+    return this._listeners.length - this._toRemove.length;
+  }
+
+  /**
+   * 注册事件触发时执行的回调函数
+   * @param {Function} listener 事件触发时执行的回调函数
+   * @param {Object} [scope] 侦听器函数中this的指针
+   * @return {Function} 用于取消侦听器监测的函数
+   *
+   * @see Event#removeEventListener
+   * @see Event#raise
+   */
+
+  addEventListener(listener, scope) {
+    if (typeof listener !== "function") {
+      console.warn("侦听器应该是一个函数");
+    }
+
+    this._listeners.push(listener);
+    this._scopes.push(scope);
+
+    const event = this;
+    return function () {
+      event.removeEventListener(listener, scope);
+    };
+  }
+
+  /**
+   * 注销事件触发时的回调函数
+   * @param {Function} listener 将要被注销的函数
+   * @param {Object} [scope] 侦听器函数中this的指针
+   * @return {Boolean} 如果为真，事件被成功注销，否则，事件注销失败
+   *
+   * @see Event#addEventListener
+   * @see Event#raise
+   */
+  removeEventListener(listener, scope) {
+    if (typeof listener !== "function") {
+      console.warn("侦听器应该是一个函数");
+    }
+    const listeners = this._listeners;
+    const scopes = this._scopes;
+
+    let index = -1;
+    for (let i = 0; i < listeners.length; i++) {
+      if (listeners[i] === listener && scopes[i] === scope) {
+        index = i;
+        break;
+      }
+    }
+
+    if (index !== -1) {
+      if (this._insideRaiseEvent) {
+        // In order to allow removing an event subscription from within
+        // a callback, we don't actually remove the items here.  Instead
+        // remember the index they are at and undefined their value.
+        this._toRemove.push(index);
+        listeners[index] = undefined;
+        scopes[index] = undefined;
+      } else {
+        listeners.splice(index, 1);
+        scopes.splice(index, 1);
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * 触发事件
+   * @param {*} arguments 此方法接受任意数据的参数并传递给侦听器函数
+   *
+   * @see Event#addEventListener
+   * @see Event#removeEventListener
+   */
+  raise() {
+    this._insideRaiseEvent = true;
+
+    let i;
+    const listeners = this._listeners;
+    const scopes = this._scopes;
+    let { length } = listeners;
+
+    for (i = 0; i < length; i++) {
+      const listener = listeners[i];
+      if (Cesium.defined(listener)) {
+        listeners[i].apply(scopes[i], arguments);
+      }
+    }
+
+    // Actually remove items removed in removeEventListener.
+    const toRemove = this._toRemove;
+    length = toRemove.length;
+    // 降序排列，从后往前删
+    if (length > 0) {
+      toRemove.sort(compareNumber);
+      for (i = 0; i < length; i++) {
+        const index = toRemove[i];
+        listeners.splice(index, 1);
+        scopes.splice(index, 1);
+      }
+      toRemove.length = 0;
+    }
+
+    this._insideRaiseEvent = false;
+  }
+}
+
+
+const _offset = new Cesium.Cartesian3();
+const _q = new Cesium.Quaternion();
+const rm3 = new Cesium.Matrix3();
+const cartesian3_1 = new Cesium.Cartesian3();
+const mat4 = new Cesium.Matrix4();
+const mat4_1 = new Cesium.Matrix4();
+
+function setColorForPrimitive(geometry, color) {
+  if (geometry instanceof Cesium.Polyline) {
+    geometry.material.uniforms.color = color;
+  } else if (geometry instanceof Cesium.Primitive) {
+    geometry.appearance.material.uniforms.color = color;
+  } else if (geometry instanceof Cesium.PointPrimitive) {
+    geometry.color = color;
+  }
+}
+function projectInAxis(normal, vector) {
+  Cesium.Cartesian2.normalize(normal, normal);
+  return Cesium.Cartesian2.dot(normal, vector);
+}
+function getPositionInPlane(pixel, helper) {
+  const viewer = helper._viewer;
+  const mousedownCartesian = new Cesium.Cartesian3();
+  const ray = viewer.camera.getPickRay(pixel);
+  const plane = new Cesium.Plane(Cesium.Cartesian3.UNIT_X, 0.0);
+  Cesium.Plane.fromPointNormal(helper.center, helper.activePrimitive.normal, plane);
+  Cesium.Plane.transform(plane, helper._modelMatrix, plane);
+  Cesium.IntersectionTests.rayPlane(ray, plane, mousedownCartesian);
+  Cesium.Matrix4.multiplyByPoint(
+    helper._inverseModelMatrix,
+    mousedownCartesian,
+    mousedownCartesian
+  );
+  return mousedownCartesian;
+}
+const cartesian2_1 = new Cesium.Cartesian2();
+const cartesian2_2 = new Cesium.Cartesian2();
+function computeAngle(helper, startPosition, endPosition) {
+  const center = helper.center;
+  Cesium.Cartesian3.subtract(startPosition, center, startPosition);
+  Cesium.Cartesian3.subtract(endPosition, center, endPosition);
+  const angle = Cesium.Cartesian3.dot(
+    Cesium.Cartesian3.normalize(startPosition, startPosition),
+    Cesium.Cartesian3.normalize(endPosition, endPosition)
+  );
+  // 旋转起点和终点的向量
+  const v1 = Cesium.Cartesian3.subtract(startPosition, endPosition, cartesian3_1);
+  const v2 = startPosition;
+  const cross = Cesium.Cartesian3.cross(v1, v2, cartesian3_1);
+  const normal = helper.activePrimitive.normal;
+  // 旋转平面的法线向量
+  const sign = Cesium.Math.sign(Cesium.Cartesian3.dot(cross, normal));
+  return Math.acos(angle) * sign;
+}
+function computeOffset(helper, startPosition, endPosition, offset) {
+  const activeAxis = helper.activePrimitive.relativeAxis || [
+    helper.activePrimitive,
+  ];
+  if (!Array.isArray(activeAxis)) {
+    return;
+  }
+  const cameraHeight = helper._viewer.camera.positionCartographic.height;
+  const delta = cameraHeight / 1047;
+  for (let axis of activeAxis) {
+    const positions = axis.positions;
+    const cartList = positions.map((_) =>
+      Cesium.Matrix4.multiplyByPoint(helper._modelMatrix, _, new Cesium.Cartesian3())
+    );
+    const pixelList = cartList.map((_) =>
+      LonLat.toPixel(_, helper._viewer.scene)
+    );
+    const length = projectInAxis(
+      Cesium.Cartesian2.subtract(...pixelList, cartesian2_1),
+      Cesium.Cartesian2.subtract(endPosition, startPosition, cartesian2_2)
+    );
+    offset[axis.axis.toLowerCase()] = length * delta;
+  }
+  return offset;
+}
+const EModel = {
+  N: "None", // none
+  T: "T", // 移动
+  R: "R", // 旋转
+  S: "S", // 缩放
+};
+class TransformHelper {
+  /**
+   * 模型编辑控制器，虽然它也适用于点元素
+   * @param {object} [options] 具有以下属性
+   * @param {number} [options.lineWidth = 15] 线宽
+   * @param {Cesium.Color} [options.xAxisColor = Cesium.Color.RED] X轴的颜色
+   * @param {Cesium.Color} [options.yAxisColor = Cesium.Color.GREEN] Y轴颜色
+   * @param {Cesium.Color} [options.zAxisColor = Cesium.Color.BLUE] Z轴颜色
+   * @param {Cesium.Color} [options.scaleAxisColor = Cesium.Color.WHITE] 缩放轴的颜色
+   * @param {Cesium.Color} [options.activeAxisColor = Cesium.Color.YELLOW] 被激活的坐标标轴颜色
+   * @param {boolean} [options.translateEnabled = true] 是否创建平移控制器
+   * @param {boolean} [options.rotateEnabled = false] 是否创建旋转控制器，仅对模型可用
+   * @param {boolean} [options.scaleEnabled = false] 是否创建缩放控制器，仅对模型有效
+   * @param {number} [options.xAxisLength] X轴的长度, 如果未定义将自动计算
+   * @param {number} [options.yAxisLength] Y轴的长度，如果未定义将自动计算
+   * @param {number} [options.zAxisLength] Z轴长度，如果未定义将自动计算
+   * @param {number} [options.scaleAxisLength] 缩放轴的长度，如果未定义将自动计算
+   * @param {number} [options.rotatePlaneRadius] 旋转轴的半径，如果未定义将自动计算
+   * @param {boolean} [options.sizeInPixel = false] 控制器的大小是否以像素为单位
+   * @param {number} [options.radiusRatio = 1] 如果没有为坐标轴指定长度，将使用模型boundingSphere的半径乘该系数作长度
+   * @param {Cesium.Cartesian3} [options.originOffset = Cesium.Cartesian3.ZERO] 默认原点在点或模型的中心位置，该值设置相对于默认位置的偏移
+   *
+   * @example
+   * const helper = new TransformHelper({
+   *     rotateEnabled: true,
+   *     translateEnabled: true,
+   *     scaleEnabled: true,
+   *     xAxisLength: 10,
+   *     yAxisLength: 10,
+   *     zAxisLength: 10,
+   *     scaleAxisLength: 10,
+   *     rotatePlaneRadius: 8
+   * });
+   *
+   * helper.addTo(viewer);
+   * helper.bind(model);
+   */
+  constructor(options = {}) {
+    this.lineWidth = defaultValue(options.lineWidth, 15);
+    this.xAxisColor = defaultValue(options.xAxisColor, Cesium.Color.RED);
+    this.yAxisColor = defaultValue(options.yAxisColor, Cesium.Color.GREEN);
+    this.zAxisColor = defaultValue(options.zAxisColor, Cesium.Color.BLUE);
+    this.scaleAxisColor = defaultValue(options.scaleAxisColor, Cesium.Color.WHITE);
+    this.activeAxisColor = defaultValue(options.activeAxisColor, Cesium.Color.YELLOW);
+    this.originColor = defaultValue(options.originColor, Cesium.Color.WHITE);
+    this._translateEnabled = defaultValue(options.translateEnabled, true);
+    this._rotateEnabled = defaultValue(options.rotateEnabled, false);
+    this._scaleEnabled = defaultValue(options.scaleEnabled, false);
+    this._radiusRatio = defaultValue(options.radiusRatio, 1);
+    this.xAxisLength = options.xAxisLength;
+    this.yAxisLength = options.yAxisLength;
+    this.zAxisLength = options.zAxisLength;
+    this.scaleAxisLength = options.scaleAxisLength;
+    this.root = new Cesium.PrimitiveCollection();
+    this.object = null;
+    this._modelMatrix = undefined;
+    this._primitives = [];
+    this._center = new Cesium.Cartesian3();
+    this._radius = 0;
+    this._originOffset = defaultValue(options.originOffset, new Cesium.Cartesian3());
+    this._selectedPrimitives = [];
+    this._offset = new Cesium.Cartesian3(0, 0, 0);
+    this._angle = 0;
+    this.rotatePlaneRadius = options.rotatePlaneRadius;
+    this._mode = EModel.N;
+    /**
+     * 位置或姿态发生变化前解发的事件
+     * @type {Event}
+     */
+    this.preTranformEvent = new Event();
+    /**
+     * 位置或姿态发生变化后触发的事件
+     * @type {Event}
+     */
+    this.postTransformEvent = new Event();
+  }
+  /**
+   * 获得或设置平移控件是否显示
+   * @type {boolean}
+   */
+  get translateEnabled() {
+    return this._translateEnabled;
+  }
+  set translateEnabled(val) {
+    this._translateEnabled = val;
+    for (let primitive of this._primitives) {
+      const axis = primitive.axis;
+      if (!axis) {
+        continue;
+      }
+      if (!(axis.includes(EModel.R) || axis.includes(EModel.S))) {
+        primitive.show = val;
+      }
+    }
+  }
+  /**
+   * 获得或设置旋转控件是否显示
+   * @type {boolean}
+   */
+  get rotateEnabled() {
+    return this._rotateEnabled;
+  }
+  set rotateEnabled(val) {
+    this._rotateEnabled = val;
+    for (let primitive of this._primitives) {
+      const axis = primitive.axis;
+      if (!axis) {
+        continue;
+      }
+      if (axis.includes(EModel.R)) {
+        primitive.show = val;
+      }
+    }
+  }
+  /**
+   * 获得或设置缩放控件是否显示
+   * @type {boolean}
+   */
+  get scaleEnabled() {
+    return this._scaleEnabled;
+  }
+  set scaleEnabled(val) {
+    this._scaleEnabled = val;
+    for (let primitive of this._primitives) {
+      const axis = primitive.axis;
+      if (!axis) {
+        continue;
+      }
+      if (axis.includes(EModel.S)) {
+        primitive.show = val;
+      }
+    }
+  }
+  /**
+   * 中心位置的坐标
+   * @type {Ceium.Cartesian3}
+   */
+  get center() {
+    return Cesium.Cartesian3.add(this._center, this._originOffset, new Cesium.Cartesian3());
+  }
+  /**
+   * 模型矩阵
+   * @type {Cesium.Matrix4}
+   */
+  get modelMatrix() {
+    return this._modelMatrix;
+  }
+  set modelMatrix(matrix) {
+    if (!matrix) {
+      this._modelMatrix = undefined;
+      this._inverseModelMatrix = undefined;
+      return;
+    }
+    this._modelMatrix = matrix;
+    this._inverseModelMatrix = Cesium.Matrix4.inverse(matrix, new Cesium.Matrix4());
+  }
+  /**
+   * 创建XYZ坐标轴
+   * @private
+   * @param {*} boundingSphere
+   */
+  createMoveAxis() {
+    if (!this.center) {
+      return;
+    }
+    const lineLength = this._radius * this._radiusRatio;
+    const plc = this.axisRoot;
+    const center = this.center;
+    let positions = [
+      center,
+      new Cesium.Cartesian3(
+        defaultValue(this.xAxisLength, lineLength) + center.x,
+        center.y,
+        center.z
+      ),
+    ];
+    this.xAxis = plc.add({
+      positions: positions,
+      width: this.lineWidth,
+      material: this.getAxisMaterial(this.xAxisColor),
+    });
+    this.xNormal = new Cesium.Cartesian3();
+    Cesium.Cartesian3.subtract(positions[1], positions[0], this.xNormal);
+    Cesium.Cartesian3.normalize(this.xNormal, this.xNormal);
+    this.xAux = plc.add({
+      positions: [],
+      width: this.lineWidth,
+      material: this.getAxisMaterial(this.activeAxisColor, true),
+    });
+    this.xAxis.axis = "X";
+    this.xAxis.color = this.xAxisColor;
+    positions = [
+      center,
+      new Cesium.Cartesian3(
+        center.x,
+        -defaultValue(this.yAxisLength, lineLength) + center.y,
+        center.z
+      ),
+    ];
+    this.yAxis = plc.add({
+      positions: positions,
+      width: this.lineWidth,
+      material: this.getAxisMaterial(this.yAxisColor),
+    });
+    this.yNormal = new Cesium.Cartesian3();
+    Cesium.Cartesian3.subtract(positions[1], positions[0], this.yNormal);
+    Cesium.Cartesian3.normalize(this.yNormal, this.yNormal);
+    this.yAux = plc.add({
+      positions: [],
+      width: this.lineWidth,
+      material: this.getAxisMaterial(this.activeAxisColor, true),
+    });
+    this.yAxis.axis = "Y";
+    this.yAxis.color = this.yAxisColor;
+    positions = [
+      center,
+      new Cesium.Cartesian3(
+        center.x,
+        center.y,
+        defaultValue(this.zAxisLength, lineLength) + center.z
+      ),
+    ];
+    this.zAxis = plc.add({
+      positions: positions,
+      width: this.lineWidth,
+      material: this.getAxisMaterial(this.zAxisColor),
+    });
+    this.zNormal = new Cesium.Cartesian3();
+    Cesium.Cartesian3.subtract(positions[1], positions[0], this.zNormal);
+    Cesium.Cartesian3.normalize(this.zNormal, this.zNormal);
+    this.zAux = plc.add({
+      positions: [],
+      width: this.lineWidth,
+      material: this.getAxisMaterial(this.activeAxisColor, true),
+    });
+    this.zAxis.axis = "Z";
+    this.zAxis.color = this.zAxisColor;
+    this._primitives.push(this.xAxis, this.yAxis, this.zAxis);
+  }
+  /**
+   * 创建坐标平面
+   * @private
+   */
+  createAxisPlane() {
+    this.XOYPlane = this.root.add(
+      new AxisPlane({
+        color: this.zAxisColor,
+        modelMatrix: this.modelMatrix,
+        center: this.center,
+        radius: this._radius,
+        normal: new Cesium.Cartesian3(0, 0, 1),
+        axis: "XY",
+      })
+    );
+    this.XOYPlane.relativeAxis = [this.xAxis, this.yAxis];
+    this.XOZPlane = this.root.add(
+      new AxisPlane({
+        color: this.yAxisColor,
+        modelMatrix: this.modelMatrix,
+        center: this.center,
+        radius: this._radius,
+        normal: new Cesium.Cartesian3(0, 1, 0),
+        axis: "XZ",
+      })
+    );
+    this.XOZPlane.relativeAxis = [this.xAxis, this.zAxis];
+    this.YOZPlane = this.root.add(
+      new AxisPlane({
+        color: this.xAxisColor,
+        modelMatrix: this.modelMatrix,
+        center: this.center,
+        radius: this._radius,
+        normal: new Cesium.Cartesian3(1, 0, 0),
+        axis: "YZ",
+      })
+    );
+    this.YOZPlane.relativeAxis = [this.yAxis, this.zAxis];
+    this._primitives.push(this.XOYPlane, this.YOZPlane, this.XOZPlane);
+  }
+  /**
+   * 创建坐标原点
+   * @private
+   */
+  createOrignPoint() {
+    const pc = new Cesium.PointPrimitiveCollection({
+      modelMatrix: this.modelMatrix,
+    });
+    this.origin = pc.add({
+      show: true,
+      position: this.center,
+      pixelSize: this.lineWidth * 1.5,
+      color: this.originColor,
+    });
+    this.origin.axis = "XYZ";
+    // point 中已有color属性，因此用pcolor，和其他轴中的color作用一样
+    this.origin.pcolor = this.originColor;
+    this.root.add(pc);
+    this._primitives.push(this.origin);
+  }
+  /**
+   * 创建坐标轴材质
+   * @private
+   */
+  getAxisMaterial(color, dash = false, dashLength = 16) {
+    if (dash) {
+      return new Cesium.Material({
+        fabric: {
+          type: "dasharrow",
+          source: polylineAntialiasingMaterial,
+          uniforms: {
+            color: color,
+            gapColor: Cesium.Color.TRANSPARENT,
+            dashLength: dashLength,
+            dashPattern: 255,
+          },
+        },
+      });
+    } else {
+      return new Cesium.Material({
+        fabric: {
+          type: "PolylineArrow",
+          uniforms: {
+            color: color,
+          },
+        },
+      });
+    }
+  }
+  /**
+   * 创建旋转轴
+   * @private
+   */
+  createRotateAxis() {
+    const pts = [];
+    const radius = this.rotatePlaneRadius || this._radius * this._radiusRatio;
+    const center = this.center;
+    for (let i = 0; i <= 360; i++) {
+      const rad = (i / 180) * Math.PI;
+      pts.push(
+        new Cesium.Cartesian3(
+          center.x + radius * Math.cos(rad),
+          center.y + radius * Math.sin(rad),
+          center.z
+        )
+      );
+    }
+    this.zRotate = this.axisRoot.add({
+      positions: [...pts],
+      width: this.lineWidth,
+      material: this.getAxisMaterial(this.zAxisColor, true, 0),
+    });
+    this.zRotate.axis = "RZ";
+    this.zRotate.color = this.zAxisColor;
+    this.zRotate.normal = new Cesium.Cartesian3(0, 0, 1);
+    pts.splice(0);
+    for (let i = 0; i <= 360; i++) {
+      const rad = (i / 180) * Math.PI;
+      pts.push(
+        new Cesium.Cartesian3(
+          center.x + radius * Math.cos(rad),
+          center.y,
+          center.z + radius * Math.sin(rad)
+        )
+      );
+    }
+    this.yRotate = this.axisRoot.add({
+      positions: [...pts],
+      width: this.lineWidth,
+      material: this.getAxisMaterial(this.yAxisColor, true, 0),
+    });
+    this.yRotate.axis = "RY";
+    this.yRotate.color = this.yAxisColor;
+    this.yRotate.normal = new Cesium.Cartesian3(0, 1, 0);
+    pts.splice(0);
+    for (let i = 0; i <= 360; i++) {
+      const rad = (i / 180) * Math.PI;
+      pts.push(
+        new Cesium.Cartesian3(
+          center.x,
+          center.y + radius * Math.cos(rad),
+          center.z + radius * Math.sin(rad)
+        )
+      );
+    }
+    this.xRotate = this.axisRoot.add({
+      positions: [...pts],
+      width: this.lineWidth,
+      material: this.getAxisMaterial(this.xAxisColor, true, 0),
+    });
+    this.xRotate.axis = "RX";
+    this.xRotate.color = this.xAxisColor;
+    this.xRotate.normal = new Cesium.Cartesian3(-1, 0, 0);
+
+    this.rAxuStart = this.axisRoot.add({
+      positions: [],
+      width: this.lineWidth / 2,
+      material: this.getAxisMaterial(this.activeAxisColor, true, 0),
+    });
+    this.rAxuEnd = this.axisRoot.add({
+      positions: [],
+      width: this.lineWidth / 2,
+      material: this.getAxisMaterial(this.activeAxisColor, true, 0),
+    });
+    this._primitives.push(
+      this.xRotate,
+      this.yRotate,
+      this.zRotate,
+      this.rAxuStart,
+      this.rAxuEnd
+    );
+  }
+  /**
+   * 创建缩放轴
+   * @private
+   */
+  createScaleAxis() {
+    const lineLength = this._radius * this._radiusRatio;
+    let normal = new Cesium.Cartesian3(1, 1, 1);
+    if (this.xNormal && this.yNormal && this.zNormal) {
+      Cesium.Cartesian3.add(this.xNormal, this.yNormal, normal);
+      Cesium.Cartesian3.add(normal, this.zNormal, normal);
+    }
+    Cesium.Cartesian3.normalize(normal, normal);
+    const l = defaultValue(this.scaleAxisLength, lineLength);
+    // 对角线顶点
+    const v = new Cesium.Cartesian3();
+    Cesium.Cartesian3.multiplyByScalar(normal, l, v);
+    Cesium.Cartesian3.add(this._center, v, v);
+    this.scaleAxis = this.axisRoot.add({
+      positions: [this._center, v],
+      width: this.lineWidth,
+      material: this.getAxisMaterial(this.scaleAxisColor),
+    });
+    this._primitives.push(this.scaleAxis);
+    this.scaleAxis.axis = "SXYZ";
+    this.scaleAxis.color = this.scaleAxisColor;
+  }
+  /**
+   * 绑定一个对象
+   * @param {Model|Cesium.Model|Cesium.Cartesian3} object
+   */
+  bind(object) {
+    if (!this._viewer) {
+      console.warn("please call addTo method to add to viewer");
+    }
+    this.unbind();
+    this._hasBindObject = true;
+    this.object = object;
+    if (object instanceof Cesium.Model === false) {
+      this.bindPosition(object);
+      return;
+    }
+    this.modelMatrix = object.modelMatrix;
+    const center = Cesium.Cartesian3.clone(object.boundingSphere.center);
+    Cesium.Matrix4.multiplyByPoint(this._inverseModelMatrix, center, this._center);
+    this._radius = object.boundingSphere.radius;
+    this.createPrimitive();
+  }
+  /**
+   * 为控制器绑定一个点
+   * @param {Cesium.Property|Cesium.Cartesian3} position
+   */
+  bindPosition(position) {
+    if (typeof position.getValue === "function") {
+      position = position.getValue(this._viewer.clock.currentTime);
+    }
+    if (position instanceof Cesium.Cartesian3 === false) {
+      console.warn("position is invalid");
+    }
+    this._hasBindObject = true;
+    this.modelMatrix = Cesium.Transforms.eastNorthUpToFixedFrame(position);
+    this._center = new Cesium.Cartesian3();
+    Cesium.Cartesian3.clone(this.originOffset, this._center);
+    this._radius = 10;
+    this.rotateEnabled = false;
+    this.scaleEnabled = false;
+    this.createPrimitive(false);
+  }
+  /**
+   * @private
+   * 创建控制器需要的要素
+   */
+  createPrimitive(isModel = true) {
+    const plc = new Cesium.PolylineCollection({
+      modelMatrix: this.modelMatrix,
+    });
+    this.axisRoot = plc;
+    this.root.add(plc);
+    this.createOrignPoint();
+    this.translateEnabled && this.createMoveAxis();
+    this.translateEnabled && this.createAxisPlane();
+    isModel && this.rotateEnabled && this.createRotateAxis();
+    isModel && this.scaleEnabled && this.createScaleAxis();
+  }
+  /**
+   * 解绑当前绑定对象
+   */
+  unbind() {
+    this.object = undefined;
+    this.root.removeAll();
+    this.origon = undefined;
+    this.xAxis = undefined;
+    this.yAxis = undefined;
+    this.zAxis = undefined;
+    this.modelMatrix = undefined;
+    this._hasBindObject = false;
+  }
+  /**
+   * 添加到场景
+   * @param {Cesium.Viewer} viewer
+   */
+  addTo(viewer) {
+    this._viewer = viewer;
+    viewer.scene.primitives.add(this.root);
+    this.addEventListener();
+  }
+  /**
+   * @private
+   * 监听鼠标事件
+   */
+  addEventListener() {
+    const viewer = this._viewer;
+    const handler = new Cesium.ScreenSpaceEventHandler(viewer.canvas);
+    handler.setInputAction((e) => {
+      if (!this._hasBindObject) {
+        return;
+      }
+      const feat = viewer.scene.pick(e.position);
+      if (!feat) {
+        return;
+      }
+      if (this._primitives.includes(feat.primitive)) {
+        this._mousedownPixel = e.position;
+        this.active(feat.primitive);
+        this._offset = new Cesium.Cartesian3();
+        this._angle = 0;
+        handler.setInputAction((e) => {
+          const { startPosition, endPosition } = e;
+          this.transform(startPosition, endPosition);
+        }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+        viewer.scene.screenSpaceCameraController.enableRotate = false;
+      }
+    }, Cesium.ScreenSpaceEventType.LEFT_DOWN);
+
+    handler.setInputAction((e) => {
+      if (!this._hasBindObject) {
+        return;
+      }
+      this.active(null);
+      handler.removeInputAction(Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+      viewer.scene.screenSpaceCameraController.enableRotate = true;
+      if (this.translateEnabled) {
+        this.xAux.positions = [];
+        this.yAux.positions = [];
+        this.zAux.positions = [];
+      }
+      if (this.rotateEnabled) {
+        this.rAxuStart.positions = [];
+        this.rAxuEnd.positions = [];
+      }
+    }, Cesium.ScreenSpaceEventType.LEFT_UP);
+    this._removeEventListener = function () {
+      handler.removeInputAction(Cesium.ScreenSpaceEventType.LEFT_DOWN);
+      handler.removeInputAction(Cesium.ScreenSpaceEventType.LEFT_UP);
+    };
+  }
+  /**
+   * 当前操作的坐标轴或坐标平面
+   * @private
+   * @param {*} axis
+   */
+  active(geometry) {
+    if (!(geometry || this.activePrimitive)) {
+      return;
+    }
+    if (!geometry && this.activePrimitive) {
+      setColorForPrimitive(
+        this.activePrimitive,
+        this.activePrimitive.pcolor || this.activePrimitive.color
+      );
+      if (this.activePrimitive.isAxisPlane) {
+        for (let a of this.activePrimitive.relativeAxis) {
+          setColorForPrimitive(a, a.color);
+        }
+      }
+      this.activePrimitive = undefined;
+      this._mode = EModel.N;
+      return;
+    }
+    // 如果激活的是坐标平面，平面所在的坐标轴也需要高亮
+    if (geometry.isAxisPlane) {
+      for (let a of geometry.relativeAxis) {
+        setColorForPrimitive(a, this.activeAxisColor);
+      }
+    }
+    this.activePrimitive = geometry;
+    setColorForPrimitive(this.activePrimitive, this.activeAxisColor);
+    if (!geometry.axis) {
+      return;
+    }
+    if (geometry.axis.includes("R")) {
+      this._mode = EModel.R;
+      const mousedownCartesian = getPositionInPlane(this._mousedownPixel, this);
+      this.rAxuStart.positions = [this.center, mousedownCartesian];
+      this._startLocalPosition = mousedownCartesian;
+    } else if (geometry.axis.includes("S")) {
+      this._mode = EModel.S;
+    } else {
+      this._mode = EModel.T;
+    }
+  }
+  /**
+   * 从场景中删除
+   */
+  remove() {
+    this._viewer.scene.primitives.remove(this.root);
+    this._removeEventListener();
+    this._primitives.splice(0);
+  }
+  /**
+   * 平移
+   * @private
+   * @param {*} startPosition
+   * @param {*} endPosition
+   */
+  transform(startPosition, endPosition) {
+    this.preTranformEvent.raise(Cesium.Matrix4.clone(this.modelMatrix, {}));
+    if (this.activePrimitive === this.origin) {
+      const translation = LonLat.toCartesian(
+        LonLat.fromPixel(endPosition, this._viewer)
+      );
+      Cesium.Matrix4.setTranslation(this._modelMatrix, translation, this._modelMatrix);
+      this.modelMatrix = this._modelMatrix;
+      for (let primitive of this.root._primitives) {
+        primitive.modelMatrix = this.modelMatrix;
+      }
+    } else if (this._mode === EModel.T) {
+      computeOffset(this, startPosition, endPosition, _offset);
+      this.translate(_offset);
+    } else if (this._mode === EModel.R) {
+      const startLocalPosition = getPositionInPlane(startPosition, this);
+      const endLocalPosition = getPositionInPlane(endPosition, this);
+      const angle = computeAngle(this, startLocalPosition, endLocalPosition);
+      this.rotate(angle);
+    } else if (this._mode === EModel.S) {
+      computeOffset(this, startPosition, endPosition, _offset);
+      const s =
+        -_offset.sxyz / Cesium.Cartesian3.distance(...this.scaleAxis.positions) + 1;
+      this.scale(new Cesium.Cartesian3(s, s, s));
+    }
+    this.postTransformEvent.raise(Cesium.Matrix4.clone(this.modelMatrix, {}));
+  }
+  scale(scale) {
+    const scaleMatrix = Cesium.Matrix4.fromScale(scale, mat4);
+    Cesium.Matrix4.multiply(this._modelMatrix, scaleMatrix, this._modelMatrix);
+    this.modelMatrix = this._modelMatrix;
+    for (let primitive of this.root._primitives) {
+      Cesium.Matrix4.multiply(
+        primitive.modelMatrix,
+        scaleMatrix,
+        primitive.modelMatrix
+      );
+    }
+  }
+  /**
+   * 旋转
+   * @private
+   * @param {*} angle
+   */
+  rotate(angle) {
+    this._angle += angle;
+    const axis = this.activePrimitive.normal;
+    const translation = Cesium.Matrix4.fromTranslation(this.center, mat4);
+    const q = Cesium.Quaternion.fromAxisAngle(axis, angle, _q);
+    const roateMatrix = Cesium.Matrix3.fromQuaternion(q, rm3);
+    const inverseTranslation = Cesium.Matrix4.fromTranslation(
+      Cesium.Cartesian3.negate(this.center, cartesian3_1),
+      mat4_1
+    );
+    Cesium.Matrix4.multiply(this.modelMatrix, translation, this.modelMatrix);
+    Cesium.Matrix4.multiplyByMatrix3(this.modelMatrix, roateMatrix, this.modelMatrix);
+    Cesium.Matrix4.multiply(this.modelMatrix, inverseTranslation, this.modelMatrix);
+    for (let primitive of this.root._primitives) {
+      Cesium.Matrix4.multiply(
+        primitive.modelMatrix,
+        translation,
+        primitive.modelMatrix
+      );
+      Cesium.Matrix4.multiplyByMatrix3(
+        primitive.modelMatrix,
+        roateMatrix,
+        primitive.modelMatrix
+      );
+      Cesium.Matrix4.multiply(
+        primitive.modelMatrix,
+        inverseTranslation,
+        primitive.modelMatrix
+      );
+    }
+    this.modelMatrix = this._modelMatrix;
+    this.createRotateAux(this._startLocalPosition, this._angle);
+  }
+  /**
+   * 平移
+   * @param {*} offset
+   */
+  translate(offset) {
+    if (!this.activePrimitive) {
+      return;
+    }
+    const axis = this.activePrimitive.axis;
+    if (axis.indexOf("X") === -1) {
+      offset.x = 0;
+    }
+    if (axis.indexOf("Y") === -1) {
+      offset.y = 0;
+    }
+    if (axis.indexOf("Z") === -1) {
+      offset.z = 0;
+    }
+    offset.x = -offset.x;
+    offset.z = -offset.z;
+    Cesium.Cartesian3.add(this._offset, offset, this._offset);
+    const matrix = Cesium.Matrix4.fromTranslation(offset);
+    Cesium.Matrix4.multiply(this._modelMatrix, matrix, this._modelMatrix);
+    this.modelMatrix = this._modelMatrix;
+    for (let primitive of this.root._primitives) {
+      Cesium.Matrix4.multiply(primitive.modelMatrix, matrix, primitive.modelMatrix);
+    }
+    this.createAux(this._offset, matrix);
+  }
+  /**
+   * 创建平移辅助线
+   * @private
+   * @param {*} offset
+   */
+  createAux(offset) {
+    if (offset.x > 0) {
+      const p1 = Cesium.Cartesian3.clone(this.xAxis.positions[0]);
+      const p2 = Cesium.Cartesian3.clone(this.xAxis.positions[0]);
+      p2.x += -offset.x;
+      this.xAux.positions = [p1, p2];
+    } else {
+      const p1 = Cesium.Cartesian3.clone(this.xAxis.positions[1]);
+      const p2 = Cesium.Cartesian3.clone(this.xAxis.positions[1]);
+      p2.x += -offset.x;
+      this.xAux.positions = [p1, p2];
+    }
+    if (offset.y < 0) {
+      const p1 = Cesium.Cartesian3.clone(this.yAxis.positions[0]);
+      const p2 = Cesium.Cartesian3.clone(this.yAxis.positions[0]);
+      p2.y += -offset.y;
+      this.yAux.positions = [p1, p2];
+    } else {
+      const p1 = Cesium.Cartesian3.clone(this.yAxis.positions[1]);
+      const p2 = Cesium.Cartesian3.clone(this.yAxis.positions[1]);
+      p2.y += -offset.y;
+      this.yAux.positions = [p1, p2];
+    }
+    if (offset.z > 0) {
+      const p1 = Cesium.Cartesian3.clone(this.zAxis.positions[0]);
+      const p2 = Cesium.Cartesian3.clone(this.zAxis.positions[0]);
+      p2.z += -offset.z;
+      this.zAux.positions = [p1, p2];
+    } else {
+      const p1 = Cesium.Cartesian3.clone(this.zAxis.positions[1]);
+      const p2 = Cesium.Cartesian3.clone(this.zAxis.positions[1]);
+      p2.z += -offset.z;
+      this.zAux.positions = [p1, p2];
+    }
+  }
+  /**
+   * 创建旋转辅助线
+   * @private
+   * @param {*} startLocalPosition
+   * @param {*} angle
+   */
+  createRotateAux(startLocalPosition, angle) {
+    const startPosition = this._startLocalPosition;
+    if (!startPosition) {
+      return;
+    }
+    const q = Cesium.Quaternion.fromAxisAngle(this.activePrimitive.normal, -angle);
+    const matrix3 = Cesium.Matrix3.fromQuaternion(q, rm3);
+    const rotation = Cesium.Matrix4.fromRotation(matrix3, mat4);
+    let position = Cesium.Cartesian3.subtract(
+      startLocalPosition,
+      this.center,
+      cartesian3_1
+    );
+    Cesium.Matrix4.multiplyByPoint(rotation, position, position);
+    Cesium.Cartesian3.add(this.center, position, position);
+    this.rAxuEnd.positions = [this.center, position];
+  }
+}
+
+
+      // ============================================================
+      // Vue 应用
+      // ============================================================
+      createApp({
+        // viewer / imageryLayer / helper / model 刻意不放进 data：
+        // Vue 3 的深度响应式会把 Cesium.Cartesian3 / Model 等 Cesium 对象包成 Proxy，
+        // 流进 Cesium 内部既拖慢热路径，也可能干扰其身份判断。
+        data() {
+          return {
+            statusText: "模型加载中…",
+            params: {
+              move: true, // 平移
+              rotate: true, // 旋转
+              scale: true, // 缩放
+            },
+          };
+        },
+
+        async mounted() {
+          this.initMap();
+          await this.addModel();
+        },
+
+        beforeUnmount() {
+          if (this.helper) this.helper.remove();
+          if (this.pointHelper) this.pointHelper.remove();
+        },
+
+        methods: {
+          initMap() {
+            let viewer = new Cesium.Viewer("cesiumContainer", {
+              baseLayer: false,
+              animation: false,
+              timeline: false,
+              fullscreenButton: false,
+              infoBox: false,
+              geocoder: false,
+              homeButton: false,
+              sceneModePicker: false,
+              baseLayerPicker: false,
+              navigationHelpButton: false,
+              selectionIndicator: false,
+              shouldAnimate: true,
+            });
+
+            window.viewer = viewer;
+            this.viewer = viewer;
+            viewer.scene.debugShowFramesPerSecond = true;
+            viewer.scene.globe.enableLighting = false;
+            viewer.scene.fog.enabled = true;
+            viewer.scene.fog.density = 0.00008;
+            viewer.scene.skyAtmosphere.show = true;
+            viewer.scene.postProcessStages.fxaa.enabled = true;
+            viewer._cesiumWidget._creditContainer.style.display = "none";
+
+            this.imageryLayer = viewer.imageryLayers.addImageryProvider(
+              new Cesium.UrlTemplateImageryProvider({
+                url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                maximumLevel: 18,
+              }),
+            );
+
+            this.resetCamera();
+          },
+
+          async addModel() {
+            try {
+              const position = Cesium.Cartesian3.fromDegrees(
+                120.592886,
+                32.470705,
+                20,
+              );
+
+              // 变换控制器：平移 / 旋转 / 缩放
+              this.helper = new TransformHelper({
+                rotateEnabled: this.params.rotate,
+                translateEnabled: this.params.move,
+                scaleEnabled: this.params.scale,
+                xAxisLength: 100,
+                yAxisLength: 100,
+                zAxisLength: 100,
+                scaleAxisLength: 30,
+                rotatePlaneRadius: 8,
+              });
+              this.helper.addTo(this.viewer);
+
+              let animations = [];
+              const model = await Cesium.Model.fromGltfAsync({
+                url: "./data/models/drone.glb",
+                modelMatrix: Cesium.Transforms.headingPitchRollToFixedFrame(
+                  position,
+                  new Cesium.HeadingPitchRoll(),
+                ),
+                minimumPixelSize: 56,
+                lightColor: new Cesium.Cartesian3(5, 5, 5), // 亮度
+                gltfCallback: (gltf) => {
+                  animations = gltf.animations;
+                },
+              });
+              this.viewer.scene.primitives.add(model);
+              this.model = model;
+
+              model.readyEvent.addEventListener((gltf) => {
+                if (animations && animations.length) {
+                  animations.forEach((animation, index) => {
+                    model.activeAnimations.add({
+                      index: index,
+                      loop: Cesium.ModelAnimationLoop.REPEAT,
+                      multiplier: 0.5,
+                    });
+                  });
+                }
+                this.helper.bind(model);
+                // 模型就绪后 boundingSphere 才有效，此时再飞过去
+                this.viewer.flyTo(model, { duration: 2 });
+                this.statusText =
+                  "拖动红/绿/蓝坐标轴沿轴移动，拖动彩色半透明平面在平面内移动，拖动圆环旋转，拖动白色对角线缩放。";
+              });
+
+              // 在模型附近添加一个可移动的点，用 bindPosition 绑定
+              const point = this.viewer.entities.add({
+                position: Cesium.Cartesian3.fromDegrees(
+                  120.592886,
+                  32.473005,
+                  20,
+                ),
+                point: {
+                  pixelSize: 10,
+                  color: Cesium.Color.RED,
+                },
+              });
+              this.point = point;
+
+              this.pointHelper = new TransformHelper({
+                rotateEnabled: true,
+                translateEnabled: true,
+                scaleEnabled: true,
+                xAxisLength: 100,
+                yAxisLength: 100,
+                zAxisLength: 100,
+                scaleAxisLength: 30,
+                rotatePlaneRadius: 8,
+              });
+              this.pointHelper.addTo(this.viewer);
+              this.pointHelper.bindPosition(point.position);
+              // 绑定点位时需要手动把变换后的矩阵回写到实体位置
+              this.pointHelper.postTransformEvent.addEventListener(
+                (modelMatrix) => {
+                  const newPosition = new Cesium.Cartesian3();
+                  Cesium.Matrix4.getTranslation(modelMatrix, newPosition);
+                  point.position = newPosition;
+                },
+              );
+            } catch (e) {
+              console.warn("模型加载失败：", e.message);
+              this.statusText = "模型加载失败：" + e.message;
+            }
+          },
+
+          resetCamera() {
+            if (!this.viewer) return;
+            this.viewer.camera.setView({
+              destination: Cesium.Cartesian3.fromDegrees(
+                120.587886,
+                32.457705,
+                1000,
+              ),
+              orientation: {
+                heading: Cesium.Math.toRadians(20.0),
+                pitch: Cesium.Math.toRadians(-30.0),
+                roll: Cesium.Math.toRadians(0),
+              },
+            });
+          },
+
+        },
+      }).mount("#app");
+    </script>
+  </body>
+</html>
