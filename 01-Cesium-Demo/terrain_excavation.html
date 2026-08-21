@@ -190,6 +190,7 @@
           this.syncTimer = null; // 高程同步防抖计时器
           this.runSync = null; // 防抖到期后执行的同步函数
           this.onSync = options.onSync ?? null; // 高程同步后的回调（刷新面板）
+          this.getTileset = options.getTileset ?? (() => null); // 拿到 3D Tiles 白模
         }
 
         // 高程变化小于此值不重建几何体（米）
@@ -266,7 +267,10 @@
           const provider = this.viewer.terrainProvider;
           const fallback = () =>
             cartographics.map(() => this.lonLats[0]?.z ?? 0);
-          if (!provider || provider instanceof Cesium.EllipsoidTerrainProvider) {
+          if (
+            !provider ||
+            provider instanceof Cesium.EllipsoidTerrainProvider
+          ) {
             return fallback();
           }
           try {
@@ -319,7 +323,10 @@
             delta = Math.max(delta, Math.abs(height - this.detailHeights[i]));
             // 阈值取 0.5 m：LOD 切换带来的亚米级抖动不值得重建几何体，
             // 用 1e-3 会让 changed 恒为 true，每次相机事件都全量重建。
-            if (Math.abs(height - this.maxHeights[i]) > TerrainExcavation.HEIGHT_EPSILON) {
+            if (
+              Math.abs(height - this.maxHeights[i]) >
+              TerrainExcavation.HEIGHT_EPSILON
+            ) {
               this.maxHeights[i] = height;
               changed = true;
             }
@@ -468,6 +475,17 @@
           const points = this.lonLats.map((p) =>
             Cesium.Cartesian3.fromDegrees(p.x, p.y),
           );
+          this.viewer.scene.globe.clippingPlanes =
+            new Cesium.ClippingPlaneCollection({
+              planes: this.buildClippingPlanes(points),
+              edgeWidth: this.edgeWidth,
+              edgeColor: this.edgeColor,
+            });
+          this.applyTilesetClipping();
+        }
+
+        /** 由多边形顶点生成一组裁剪面（凸多边形专用）：每条边一个竖直平面，法线朝外 */
+        buildClippingPlanes(points) {
           const length = points.length;
           const planes = [];
 
@@ -514,13 +532,7 @@
             );
             planes.push(new Cesium.ClippingPlane(normal, distance));
           }
-
-          this.viewer.scene.globe.clippingPlanes =
-            new Cesium.ClippingPlaneCollection({
-              planes: planes,
-              edgeWidth: this.edgeWidth,
-              edgeColor: this.edgeColor,
-            });
+          return planes;
         }
 
         /** 裁剪多边形方案（Cesium 1.111+）：支持任意凹多边形 */
@@ -532,27 +544,147 @@
             new Cesium.ClippingPolygonCollection({
               polygons: [new Cesium.ClippingPolygon({ positions: positions })],
             });
+          this.applyTilesetClipping();
+        }
+
+        // ---------- 3D Tiles 白模裁剪 ----------
+
+        /**
+         * 把与 globe 相同的裁剪同步到 3D Tiles 白模上。
+         *
+         * globe 的裁剪面/多边形是 ECEF 世界坐标；而 Cesium3DTileset 的裁剪
+         * 是在白模本地坐标系里生效的（root.transform 定义的局部米制空间），
+         * 两者不是同一个坐标系，直接复用会裁错位置，必须做一次坐标变换。
+         */
+        applyTilesetClipping() {
+          const tileset = this.getTileset();
+          if (!tileset || this.lonLats.length < 3) return;
+
+          if (this.clipMode === "polygons") {
+            tileset.clippingPolygons = new Cesium.ClippingPolygonCollection({
+              polygons: [
+                new Cesium.ClippingPolygon({
+                  positions: this.toTilesetLocal(this.lonLats, tileset),
+                }),
+              ],
+            });
+          } else {
+            const points = this.lonLats.map((p) =>
+              Cesium.Cartesian3.fromDegrees(p.x, p.y),
+            );
+            tileset.clippingPlanes = new Cesium.ClippingPlaneCollection({
+              planes: this.toTilesetLocalPlanes(
+                this.buildClippingPlanes(points),
+                tileset,
+              ),
+              edgeWidth: this.edgeWidth,
+              edgeColor: this.edgeColor,
+            });
+          }
+        }
+
+        /** 白模 local→世界(ECEF) 的复合变换 = modelMatrix × root.transform */
+        getTilesetModelMatrix(tileset) {
+          const modelMatrix = Cesium.defined(tileset.modelMatrix)
+            ? tileset.modelMatrix
+            : Cesium.Matrix4.IDENTITY;
+          const rootTransform =
+            Cesium.defined(tileset.root) &&
+            Cesium.defined(tileset.root.transform)
+              ? tileset.root.transform
+              : Cesium.Matrix4.IDENTITY;
+          return Cesium.Matrix4.multiply(
+            modelMatrix,
+            rootTransform,
+            new Cesium.Matrix4(),
+          );
+        }
+
+        /** ECEF 顶点 → 白模本地坐标 */
+        toTilesetLocal(lonLats, tileset) {
+          const inv = Cesium.Matrix4.inverse(
+            this.getTilesetModelMatrix(tileset),
+            new Cesium.Matrix4(),
+          );
+          return lonLats.map((p) =>
+            Cesium.Matrix4.multiplyByPoint(
+              inv,
+              Cesium.Cartesian3.fromDegrees(p.x, p.y),
+              new Cesium.Cartesian3(),
+            ),
+          );
+        }
+
+        /**
+         * ECEF 裁剪面 → 白模本地裁剪面。
+         * 白模根变换是纯旋转+平移（无缩放），法线乘 Rᵀ、距离加上 n·t 即可。
+         */
+        toTilesetLocalPlanes(planes, tileset) {
+          const modelMatrix = this.getTilesetModelMatrix(tileset);
+          const rotation = new Cesium.Matrix3();
+          const translation = new Cesium.Cartesian3();
+          Cesium.Matrix4.getRotation(modelMatrix, rotation);
+          Cesium.Matrix4.getTranslation(modelMatrix, translation);
+          // 纯旋转下 R 的逆 = R 的转置，直接用逆变换法线
+          const invRotation = Cesium.Matrix3.inverse(
+            rotation,
+            new Cesium.Matrix3(),
+          );
+
+          return planes.map((plane) => {
+            const normal = Cesium.Matrix3.multiplyByVector(
+              invRotation,
+              plane.normal,
+              new Cesium.Cartesian3(),
+            );
+            const distance =
+              plane.distance + Cesium.Cartesian3.dot(plane.normal, translation);
+            return new Cesium.ClippingPlane(normal, distance);
+          });
         }
 
         clearClipping() {
           const globe = this.viewer.scene.globe;
           if (globe.clippingPlanes) globe.clippingPlanes = undefined;
           if (globe.clippingPolygons) globe.clippingPolygons = undefined;
+
+          const tileset = this.getTileset();
+          if (tileset) {
+            if (tileset.clippingPlanes) tileset.clippingPlanes = undefined;
+            if (tileset.clippingPolygons) tileset.clippingPolygons = undefined;
+          }
         }
 
         setClippingEnabled(enabled) {
           const globe = this.viewer.scene.globe;
-          if (globe.clippingPlanes) globe.clippingPlanes.enabled = enabled;
-          if (globe.clippingPolygons) globe.clippingPolygons.enabled = enabled;
+          const tileset = this.getTileset();
+          const collections = [
+            globe.clippingPlanes,
+            globe.clippingPolygons,
+            tileset && tileset.clippingPlanes,
+            tileset && tileset.clippingPolygons,
+          ];
+          for (const collection of collections) {
+            if (collection) collection.enabled = enabled;
+          }
         }
 
         setEdgeStyle(color, width) {
           this.edgeColor = color;
           this.edgeWidth = width;
-          const planes = this.viewer.scene.globe.clippingPlanes;
-          if (planes) {
-            planes.edgeColor = color;
-            planes.edgeWidth = width;
+          const globe = this.viewer.scene.globe;
+          const tileset = this.getTileset();
+          const collections = [
+            globe.clippingPlanes,
+            globe.clippingPolygons,
+            tileset && tileset.clippingPlanes,
+            tileset && tileset.clippingPolygons,
+          ];
+          for (const collection of collections) {
+            if (collection) {
+              collection.edgeColor = color;
+              collection.edgeWidth = width;
+            }
           }
         }
 
@@ -606,7 +738,8 @@
         setMaterials(bottomMaterial, sideMaterial) {
           this.bottomMaterial = bottomMaterial;
           this.sideMaterial = sideMaterial;
-          if (this.bottomEntity) this.bottomEntity.polygon.material = bottomMaterial;
+          if (this.bottomEntity)
+            this.bottomEntity.polygon.material = bottomMaterial;
           if (this.wallEntity) this.wallEntity.wall.material = sideMaterial;
         }
 
@@ -723,6 +856,7 @@
           this.strataCanvas = makeStrataTexture();
           this.initMap();
           this.addlilgui();
+          this.load3DTiles();
         },
 
         beforeUnmount() {
@@ -788,6 +922,22 @@
             this.resetCamera();
           },
 
+          async load3DTiles() {
+            try {
+              let tileset = await Cesium.Cesium3DTileset.fromUrl(
+                "./data/tileset/baimo/tileset.json",
+                { maximumScreenSpaceError: 16, maximumMemoryUsage: 2048 },
+              );
+              this.tileset = tileset;
+              this.viewer.scene.primitives.add(tileset);
+              // 白模在开挖之后才加载完时，补一次裁剪同步
+              if (this.excavation) this.excavation.applyTilesetClipping();
+            } catch (e) {
+              console.warn("3D Tileset 加载失败：", e.message);
+              this.statusText = "白模加载失败：" + e.message;
+            }
+          },
+
           addlilgui() {
             let myLilGui = new GUI({ title: "地形开挖" });
             this.myLilGui = myLilGui;
@@ -797,7 +947,9 @@
             drawFolder
               .add({ draw: () => this.startDraw() }, "draw")
               .name("绘制开挖范围");
-            drawFolder.add(this.params, "autoExcavate").name("绘制完成自动开挖");
+            drawFolder
+              .add(this.params, "autoExcavate")
+              .name("绘制完成自动开挖");
             drawFolder
               .add({ run: () => this.runExcavate() }, "run")
               .name("重新开挖");
@@ -958,10 +1110,12 @@
             this.cancelDraw();
             this.movingPosition = null;
             this.statusText = `范围绘制完成，共 ${this.drawPositions.length} 个顶点。`;
+            // 绘制结束后冻结预览的动态属性，否则贴地线/贴地面会持续每帧重建
             this.freezeDrawPreview();
             if (this.params.autoExcavate) this.runExcavate();
           },
 
+          /** 把预览实体的 CallbackProperty 换成静态值，停止每帧几何重建 */
           freezeDrawPreview() {
             const ring = this.drawPositions.slice();
             if (ring.length > 2) ring.push(ring[0]);
@@ -1054,6 +1208,7 @@
             if (!this.excavation) {
               this.excavation = new TerrainExcavation({
                 viewer: this.viewer,
+                getTileset: () => this.tileset,
                 onSync: () => {
                   this.updateStatus();
                   this.updateRepeat();
@@ -1095,6 +1250,8 @@
             if (this.params.textureMode === "none") {
               return new Cesium.ColorMaterialProperty(color);
             }
+            // 静态 repeat —— 不再用 CallbackProperty 每帧轮询，
+            // 参数变化时通过 updateRepeat() 手动刷新
             return new Cesium.ImageMaterialProperty({
               image: this.resolveImage(isBottom),
               color: color,
@@ -1205,7 +1362,7 @@
           resetCamera() {
             if (!this.viewer) return;
             this.viewer.camera.setView({
-              destination: Cesium.Cartesian3.fromDegrees(102.2, 29.58, 6000),
+              destination: Cesium.Cartesian3.fromDegrees(114.37, 30.5, 8000),
               orientation: {
                 heading: Cesium.Math.toRadians(0),
                 pitch: Cesium.Math.toRadians(-35),
