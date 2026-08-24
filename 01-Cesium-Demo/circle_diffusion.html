@@ -1,0 +1,750 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cesium 圆形扩散</title>
+    <script>
+      window.CESIUM_BASE_URL =
+        "https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/";
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Cesium.js"></script>
+    <link
+      href="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Widgets/widgets.css"
+      rel="stylesheet"
+    />
+    <style>
+      html,
+      body,
+      #app,
+      #cesiumContainer {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #000;
+      }
+
+      .lil-gui {
+        top: 10px;
+        left: 10px;
+        z-index: 999;
+      }
+
+      .help-panel {
+        position: absolute;
+        right: 12px;
+        bottom: 12px;
+        z-index: 998;
+        padding: 8px 12px;
+        border: 1px solid rgba(130, 210, 255, 0.25);
+        border-radius: 6px;
+        color: rgba(232, 247, 255, 0.9);
+        background: rgba(8, 20, 32, 0.72);
+        font: 12px/1.6 sans-serif;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="cesiumContainer"></div>
+      <div class="help-panel">
+        距矩形 &lt;100米：扩散圈变橙 ｜ 进入矩形内：扩散圈变红<br />
+        使用左上角面板调整扩散效果
+      </div>
+    </div>
+
+    <script type="module">
+      const { createApp } = Vue;
+      import GUI from "https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.esm.js";
+
+      /*
+       * 使用材质坐标计算片元到圆心的距离，借助 Cesium 帧号驱动扩散环。
+       * speed、ringWidth 和 feather 都是归一化材质参数，不会改变地理圆的半径。
+       */
+      const CIRCLE_DIFFUSION_SOURCE = /* glsl */ `
+        czm_material czm_getMaterial(czm_materialInput materialInput) {
+          czm_material material = czm_getDefaultMaterial(materialInput);
+          vec2 centered = materialInput.st - vec2(0.5);
+          float distanceFromCenter = length(centered) * 2.0;
+          float progress = fract(czm_frameNumber * speed * 0.001);
+          float distanceToRing = abs(distanceFromCenter - progress);
+          float ring = 1.0 - smoothstep(0.0, ringWidth, distanceToRing);
+          float edgeFade = 1.0 - smoothstep(
+            1.0 - feather,
+            1.0,
+            distanceFromCenter
+          );
+
+          material.diffuse = color.rgb;
+          material.alpha = color.a * opacity * ring * edgeFade;
+          return material;
+        }
+      `;
+
+      // 城市上空的固定示例航线，包含 5 个转折点。
+      // 坐标格式：[经度, 纬度, 高度(米)]。
+      const WUHAN_ROUTE = [
+        // [114.3, 30.585, 200],
+        [114.316, 30.598, 200],
+        [114.334, 30.578, 200],
+        [114.315, 30.556, 200],
+        [114.286, 30.56, 200],
+        [114.274, 30.585, 200],
+      ];
+
+      // _materialCache 是项目现有自定义材质示例采用的 Cesium 私有注册入口。
+      Cesium.Material._materialCache.addMaterial("CircleDiffusion", {
+        fabric: {
+          type: "CircleDiffusion",
+          uniforms: {
+            color: Cesium.Color.fromCssColorString("#19d3ff"),
+            speed: 2.0,
+            ringWidth: 0.06,
+            feather: 0.04,
+            opacity: 0.9,
+          },
+          source: CIRCLE_DIFFUSION_SOURCE,
+        },
+        translucent: true,
+      });
+
+      // 让 Entity 椭圆能够使用上述 CircleDiffusion 材质的 MaterialProperty 包装。
+      class CircleDiffusionMaterialProperty {
+        constructor(options) {
+          this._definitionChanged = new Cesium.Event();
+          this._color =
+            options?.color || Cesium.Color.fromCssColorString("#19d3ff");
+          this._speed = options?.speed ?? 10;
+          this._ringWidth = options?.ringWidth ?? 0.06;
+          this._feather = options?.feather ?? 0.04;
+          this._opacity = options?.opacity ?? 0.9;
+        }
+        get isConstant() {
+          return false;
+        }
+        get definitionChanged() {
+          return this._definitionChanged;
+        }
+        getType() {
+          return "CircleDiffusion";
+        }
+        getValue(time, result) {
+          if (!Cesium.defined(result)) {
+            result = {};
+          }
+          const color =
+            typeof this._color?.getValue === "function"
+              ? this._color.getValue(time)
+              : this._color;
+          result.color = Cesium.Color.clone(
+            color || Cesium.Color.fromCssColorString("#19d3ff"),
+            result.color,
+          );
+          result.speed = this._speed;
+          result.ringWidth = this._ringWidth;
+          result.feather = this._feather;
+          result.opacity = this._opacity;
+          return result;
+        }
+        equals(other) {
+          return (
+            this === other ||
+            (other instanceof CircleDiffusionMaterialProperty &&
+              this._speed === other._speed &&
+              this._ringWidth === other._ringWidth &&
+              this._feather === other._feather &&
+              this._opacity === other._opacity &&
+              Cesium.Color.equals(this._color, other._color))
+          );
+        }
+      }
+
+      createApp({
+        data() {
+          return {
+            viewer: null,
+            imageryLayer: null,
+            myLilGui: null,
+            circleEntity: null,
+            circleMaterial: null,
+            routeEntity: null,
+            droneEntity: null,
+            dronePosition: null,
+            droneOrientation: null,
+            baimoTileset: null,
+            rectangle: null,
+            flightStart: null,
+            flightStop: null,
+            params: {
+              color: "#00ff00",
+              radius: 300,
+              speed: 5,
+              ringWidth: 0.25,
+              feather: 0.04,
+              opacity: 0.9,
+              longitude: 114.3,
+              latitude: 30.585,
+              height: 700,
+              show: true,
+              routeShow: true,
+              droneShow: true,
+              baimoShow: true,
+              playing: true,
+              flightSpeed: 10,
+              modelScale: 1.0,
+              modelHeadingOffset: 0,
+              followCamera: false,
+              cameraDistance: 200,
+            },
+          };
+        },
+
+        async mounted() {
+          this.initMap();
+          await this.loadBaimoTileset();
+          this.createFlightRoute();
+          this.createPolygon();
+          this.createCircle();
+          this.addLilGui();
+        },
+
+        beforeUnmount() {
+          if (this.myLilGui) {
+            this.myLilGui.destroy();
+            this.myLilGui = null;
+          }
+
+          if (this.viewer && !this.viewer.isDestroyed()) {
+            this.viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+          }
+
+          if (this.viewer && this.circleEntity) {
+            this.viewer.entities.remove(this.circleEntity);
+            this.circleEntity = null;
+          }
+
+          if (this.viewer) {
+            if (this.routeEntity) {
+              this.viewer.entities.remove(this.routeEntity);
+              this.routeEntity = null;
+            }
+            if (this.droneEntity) {
+              this.viewer.entities.remove(this.droneEntity);
+              this.droneEntity = null;
+            }
+            if (this.baimoTileset) {
+              this.viewer.scene.primitives.remove(this.baimoTileset);
+              this.baimoTileset = null;
+            }
+          }
+
+          if (this.viewer && !this.viewer.isDestroyed()) {
+            this.viewer.destroy();
+          }
+          this.viewer = null;
+          this.imageryLayer = null;
+        },
+
+        methods: {
+          initMap() {
+            const viewer = new Cesium.Viewer("cesiumContainer", {
+              baseLayer: false,
+              animation: false,
+              timeline: false,
+              fullscreenButton: false,
+              infoBox: false,
+              geocoder: false,
+              homeButton: false,
+              sceneModePicker: false,
+              baseLayerPicker: false,
+              navigationHelpButton: false,
+              selectionIndicator: false,
+              shouldAnimate: true,
+            });
+
+            window.viewer = viewer;
+            viewer.scene.debugShowFramesPerSecond = true;
+            viewer.scene.globe.enableLighting = false;
+            viewer.scene.globe.depthTestAgainstTerrain = true;
+            viewer.scene.fog.enabled = true;
+            viewer.scene.fog.density = 0.00008;
+            viewer.scene.skyAtmosphere.show = true;
+            viewer._cesiumWidget._creditContainer.style.display = "none";
+
+            this.imageryLayer = viewer.imageryLayers.addImageryProvider(
+              new Cesium.UrlTemplateImageryProvider({
+                url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                maximumLevel: 18,
+              }),
+            );
+
+            this.viewer = viewer;
+            this.resetCamera();
+          },
+
+          async loadBaimoTileset() {
+            if (!this.viewer) return;
+            try {
+              const tileset = await Cesium.Cesium3DTileset.fromUrl(
+                "./data/tileset/baimo/tileset.json",
+                { maximumScreenSpaceError: 16, maximumMemoryUsage: 2048 },
+              );
+              this.baimoTileset = tileset;
+              this.viewer.scene.primitives.add(tileset);
+            } catch (error) {
+              console.error("白膜 3D Tiles 加载失败：", error);
+            }
+          },
+
+          createCircle() {
+            if (!this.viewer || !this.dronePosition) return;
+
+            if (this.circleEntity) {
+              this.viewer.entities.remove(this.circleEntity);
+              this.circleEntity = null;
+            }
+
+            this.circleMaterial = new CircleDiffusionMaterialProperty({
+              // 颜色设为动态回调，随无人机与矩形的实时距离切换绿/橙/红。
+              color: new Cesium.CallbackProperty(
+                () => this.getCircleColor(),
+                false,
+              ),
+              speed: this.params.speed,
+              ringWidth: this.params.ringWidth,
+              feather: this.params.feather,
+              opacity: this.params.opacity,
+            });
+
+            this.circleEntity = this.viewer.entities.add({
+              name: "跟随扩散圈",
+              position: this.dronePosition,
+              ellipse: {
+                semiMajorAxis: this.params.radius,
+                semiMinorAxis: this.params.radius,
+                // 显式指定高度，实时取无人机当前位置的椭球高度，
+                // 保证扩散圈与 drone.glb 保持在相同高度。
+                height: new Cesium.CallbackProperty(() => {
+                  const position = this.dronePosition?.getValue(
+                    this.viewer?.clock?.currentTime,
+                  );
+                  return position
+                    ? Cesium.Cartographic.fromCartesian(position).height
+                    : 0;
+                }, false),
+                material: this.circleMaterial,
+                outline: false,
+                show: this.params.show,
+              },
+            });
+          },
+
+          updateCircleRadius() {
+            if (!this.circleEntity) return;
+            this.circleEntity.ellipse.semiMajorAxis.setValue(
+              this.params.radius,
+            );
+            this.circleEntity.ellipse.semiMinorAxis.setValue(
+              this.params.radius,
+            );
+          },
+
+          createFlightRoute() {
+            if (!this.viewer) return;
+
+            const routePositions = Cesium.Cartesian3.fromDegreesArrayHeights(
+              WUHAN_ROUTE.flat(),
+            );
+            this.routeEntity = this.viewer.entities.add({
+              name: "无人机航线",
+              polyline: {
+                positions: routePositions,
+                width: 4,
+                material: new Cesium.PolylineDashMaterialProperty({
+                  color: Cesium.Color.ORANGE.withAlpha(0.9),
+                  gapColor: Cesium.Color.TRANSPARENT,
+                  dashLength: 20,
+                  dashPattern: 0x0f0f,
+                }),
+                depthFailMaterial: new Cesium.PolylineDashMaterialProperty({
+                  color: Cesium.Color.YELLOW.withAlpha(0.65),
+                  gapColor: Cesium.Color.TRANSPARENT,
+                  dashLength: 20,
+                  dashPattern: 0x0f0f,
+                }),
+                show: this.params.routeShow,
+              },
+            });
+
+            const startTime = Cesium.JulianDate.now();
+            const position = new Cesium.SampledPositionProperty();
+            let elapsed = 0;
+
+            WUHAN_ROUTE.forEach((point, index) => {
+              if (index > 0) {
+                const previous = Cesium.Cartesian3.fromDegrees(
+                  ...WUHAN_ROUTE[index - 1],
+                );
+                const current = Cesium.Cartesian3.fromDegrees(...point);
+                // 以 1 米对应 1 秒建立基准时间轴，实际速度由 clock.multiplier 控制。
+                elapsed += Cesium.Cartesian3.distance(previous, current);
+              }
+              position.addSample(
+                Cesium.JulianDate.addSeconds(
+                  startTime,
+                  elapsed,
+                  new Cesium.JulianDate(),
+                ),
+                Cesium.Cartesian3.fromDegrees(...point),
+              );
+            });
+
+            this.flightStart = startTime;
+            this.flightStop = Cesium.JulianDate.addSeconds(
+              startTime,
+              elapsed,
+              new Cesium.JulianDate(),
+            );
+            this.dronePosition = position;
+            this.droneOrientation = new Cesium.VelocityOrientationProperty(
+              position,
+            );
+            const baseOrientation = this.droneOrientation;
+            const modelOrientation = new Cesium.CallbackProperty(
+              (time, result) => {
+                const base = baseOrientation.getValue(time);
+                if (!base) return undefined;
+                const offset = Cesium.Quaternion.fromHeadingPitchRoll(
+                  new Cesium.HeadingPitchRoll(
+                    Cesium.Math.toRadians(this.params.modelHeadingOffset),
+                    0,
+                    0,
+                  ),
+                );
+                return Cesium.Quaternion.multiply(
+                  base,
+                  offset,
+                  result || new Cesium.Quaternion(),
+                );
+              },
+              false,
+            );
+            this.viewer.clock.startTime = Cesium.JulianDate.clone(startTime);
+            this.viewer.clock.stopTime = Cesium.JulianDate.clone(
+              this.flightStop,
+            );
+            this.viewer.clock.currentTime = Cesium.JulianDate.clone(startTime);
+            this.viewer.clock.clockRange = Cesium.ClockRange.LOOP_STOP;
+            this.viewer.clock.multiplier = this.params.flightSpeed;
+            this.viewer.clock.shouldAnimate = this.params.playing;
+
+            this.droneEntity = this.viewer.entities.add({
+              name: "无人机",
+              position,
+              orientation: modelOrientation,
+              model: {
+                uri: "./data/models/drone.glb",
+                scale: this.params.modelScale,
+                minimumPixelSize: 42,
+                maximumScale: 120,
+                show: this.params.droneShow,
+              },
+              point: {
+                pixelSize: 8,
+                color: Cesium.Color.CYAN,
+                show: false,
+              },
+            });
+          },
+
+          createPolygon() {
+            const rectangleWest = 114.33; // 西侧经度（比路径最西点 114.274 更靠西）
+            const rectangleSouth = 30.55; // 南侧纬度（比路径最南点 30.556 更靠南）
+            const rectangleEast = 114.35; // 东侧经度（比路径最东点 114.334 更靠东）
+            const rectangleNorth = 30.59; // 北侧纬度（比路径最北点 30.598 更靠北）
+
+            this.rectangle = {
+              west: rectangleWest,
+              south: rectangleSouth,
+              east: rectangleEast,
+              north: rectangleNorth,
+            };
+
+            // 2. 在 Cesium 中创建拉伸矩形实体
+            const rectangleEntity = this.viewer.entities.add({
+              // 使用 Rectangle 几何体
+              rectangle: {
+                coordinates: Cesium.Rectangle.fromDegrees(
+                  rectangleWest, // 西经
+                  rectangleSouth, // 南纬
+                  rectangleEast, // 东经
+                  rectangleNorth, // 北纬
+                ),
+                // 材质：半透明蓝色，方便观察与路径的交集
+                material: Cesium.Color.RED.withAlpha(0.15),
+                // 高度：从地面算起的底部高度（设为0表示贴地）
+                height: 0,
+                // 拉伸高度：向上拉伸 300 米
+                extrudedHeight: 300,
+                // 可选：显示轮廓，使矩形边界更清晰
+                outline: true,
+                outlineColor: Cesium.Color.RED,
+              },
+            });
+          },
+
+          getCircleColor() {
+            const fallback = () =>
+              Cesium.Color.fromCssColorString(this.params.color);
+
+            if (!this.viewer || !this.dronePosition || !this.rectangle) {
+              return fallback();
+            }
+
+            const position = this.dronePosition.getValue(
+              this.viewer.clock.currentTime,
+            );
+            if (!position) {
+              return fallback();
+            }
+
+            const cartographic = Cesium.Cartographic.fromCartesian(position);
+            const lon = Cesium.Math.toDegrees(cartographic.longitude);
+            const lat = Cesium.Math.toDegrees(cartographic.latitude);
+            const { west, south, east, north } = this.rectangle;
+
+            const inside =
+              lon >= west && lon <= east && lat >= south && lat <= north;
+            if (inside) {
+              return Cesium.Color.fromCssColorString("#ff0000");
+            }
+
+            // 取无人机到矩形四条边最近点的水平距离（矩形的边沿经线/纬线对齐）。
+            const clampLon = Cesium.Math.clamp(lon, west, east);
+            const clampLat = Cesium.Math.clamp(lat, south, north);
+            const distance = Cesium.Cartesian3.distance(
+              Cesium.Cartesian3.fromDegrees(lon, lat),
+              Cesium.Cartesian3.fromDegrees(clampLon, clampLat),
+            );
+
+            if (distance < 300) {
+              return Cesium.Color.fromCssColorString("#ff8c00");
+            }
+
+            return fallback();
+          },
+
+          syncFlightState() {
+            if (!this.viewer) return;
+            this.viewer.clock.shouldAnimate = this.params.playing;
+            this.viewer.clock.multiplier = this.params.flightSpeed;
+            if (this.routeEntity) {
+              this.routeEntity.polyline.show = this.params.routeShow;
+            }
+            if (this.droneEntity) {
+              this.droneEntity.model.show = this.params.droneShow;
+              this.droneEntity.model.scale = this.params.modelScale;
+              this.droneEntity.model.minimumPixelSize = 42;
+            }
+          },
+
+          toggleFollowCamera() {
+            if (!this.params.followCamera) {
+              this.unlockCamera();
+              return;
+            }
+            if (!this.viewer || !this.droneEntity || !this.dronePosition)
+              return;
+
+            // 先释放旧锁定，再把相机放到无人机附近，最后交给 trackedEntity 持续跟随。
+            this.viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+            this.viewer.trackedEntity = this.droneEntity;
+
+            const position = this.dronePosition.getValue(
+              this.viewer.clock.currentTime,
+            );
+            if (position) {
+              this.viewer.camera.lookAt(
+                position,
+                new Cesium.HeadingPitchRange(
+                  0,
+                  Cesium.Math.toRadians(-25),
+                  this.params.cameraDistance,
+                ),
+              );
+            }
+          },
+
+          unlockCamera() {
+            if (this.viewer && !this.viewer.isDestroyed()) {
+              this.viewer.trackedEntity = undefined;
+              this.viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+            }
+          },
+
+          restartFlight() {
+            if (!this.viewer || !this.flightStart) return;
+            this.params.followCamera = false;
+            this.unlockCamera();
+            this.viewer.clock.currentTime = Cesium.JulianDate.clone(
+              this.flightStart,
+            );
+            this.params.playing = true;
+            this.syncFlightState();
+          },
+
+          resetWuhanCamera() {
+            if (!this.viewer) return;
+            this.viewer.camera.setView({
+              destination: Cesium.Cartesian3.fromDegrees(114.305, 30.575, 5000),
+              orientation: {
+                heading: Cesium.Math.toRadians(0),
+                pitch: Cesium.Math.toRadians(-55),
+                roll: 0,
+              },
+            });
+          },
+
+          applyMaterialUniforms() {
+            if (!this.circleMaterial) return;
+
+            // 颜色由 getCircleColor 回调实时计算，GUI 修改会直接写入 params.color。
+            this.circleMaterial._speed = this.params.speed;
+            this.circleMaterial._ringWidth = this.params.ringWidth;
+            this.circleMaterial._feather = this.params.feather;
+            this.circleMaterial._opacity = this.params.opacity;
+            this.circleMaterial.definitionChanged.raiseEvent(
+              this.circleMaterial,
+            );
+          },
+
+          syncVisibility() {
+            if (this.circleEntity) {
+              this.circleEntity.ellipse.show = this.params.show;
+            }
+          },
+
+          syncBaimoShow() {
+            if (this.baimoTileset) {
+              this.baimoTileset.show = this.params.baimoShow;
+            }
+          },
+
+          addLilGui() {
+            const gui = new GUI({ title: "圆形扩散控制" });
+            this.myLilGui = gui;
+
+            const effectFolder = gui.addFolder("扩散效果");
+            effectFolder
+              .add(this.params, "radius", 100, 2000, 50)
+              .name("半径(米)")
+              .onChange(() => this.updateCircleRadius());
+            effectFolder
+              .add(this.params, "speed", 1, 60, 1)
+              .name("扩散速度")
+              .onChange(() => this.applyMaterialUniforms());
+            effectFolder
+              .addColor(this.params, "color")
+              .name("颜色")
+              .onChange(() => this.applyMaterialUniforms());
+            effectFolder
+              .add(this.params, "ringWidth", 0.005, 0.3, 0.005)
+              .name("环带宽度")
+              .onChange(() => this.applyMaterialUniforms());
+            effectFolder
+              .add(this.params, "feather", 0, 0.2, 0.005)
+              .name("边缘羽化")
+              .onChange(() => this.applyMaterialUniforms());
+            effectFolder
+              .add(this.params, "opacity", 0, 1, 0.01)
+              .name("透明度")
+              .onChange(() => this.applyMaterialUniforms());
+            effectFolder
+              .add(this.params, "show")
+              .name("显示扩散")
+              .onChange(() => this.syncVisibility());
+
+            const flightFolder = gui.addFolder("无人机航线");
+            flightFolder
+              .add(this.params, "routeShow")
+              .name("显示航线")
+              .onChange(() => this.syncFlightState());
+            flightFolder
+              .add(this.params, "droneShow")
+              .name("显示无人机")
+              .onChange(() => this.syncFlightState());
+            flightFolder
+              .add(this.params, "playing")
+              .name("播放")
+              .onChange(() => this.syncFlightState());
+            flightFolder
+              .add(this.params, "flightSpeed", 5, 120, 5)
+              .name("飞行速度(米/秒)")
+              .onChange(() => this.syncFlightState());
+            flightFolder
+              .add(this.params, "modelScale", 0.1, 5, 0.1)
+              .name("模型缩放")
+              .onChange(() => this.syncFlightState());
+            flightFolder
+              .add(this.params, "modelHeadingOffset", -180, 180, 5)
+              .name("机头偏移(度)");
+            flightFolder
+              .add(this.params, "followCamera")
+              .name("锁定无人机视角")
+              .onChange(() => this.toggleFollowCamera());
+            flightFolder
+              .add(this.params, "cameraDistance", 20, 1000, 10)
+              .name("跟随距离(米)");
+            flightFolder
+              .add({ restart: () => this.restartFlight() }, "restart")
+              .name("重新开始");
+            flightFolder
+              .add({ resetWuhan: () => this.resetWuhanCamera() }, "resetWuhan")
+              .name("城市视角");
+
+            const layerFolder = gui.addFolder("图层控制");
+            layerFolder.add(this.imageryLayer, "show").name("影像图层");
+            layerFolder
+              .add(this.imageryLayer, "alpha", 0, 1, 0.01)
+              .name("影像透明度");
+            layerFolder
+              .add(this.params, "baimoShow")
+              .name("显示白模")
+              .onChange(() => this.syncBaimoShow());
+
+            gui
+              .add(
+                { rebuildCircle: () => this.createCircle() },
+                "rebuildCircle",
+              )
+              .name("重建圆形");
+            gui
+              .add(
+                { resetCamera: () => this.resetWuhanCamera() },
+                "resetCamera",
+              )
+              .name("城市视角");
+          },
+
+          resetCamera() {
+            if (!this.viewer) return;
+
+            this.viewer.camera.setView({
+              destination: Cesium.Cartesian3.fromDegrees(114.305, 30.525, 10000),
+              orientation: {
+                heading: Cesium.Math.toRadians(0),
+                pitch: Cesium.Math.toRadians(-55),
+                roll: 0,
+              },
+            });
+          },
+        },
+      }).mount("#app");
+    </script>
+  </body>
+</html>
