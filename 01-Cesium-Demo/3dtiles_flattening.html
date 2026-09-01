@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>3D Tiles 模型压平</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Cesium.js"></script>
+    <link
+      href="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Widgets/widgets.css"
+      rel="stylesheet"
+    />
+    <style>
+      html,
+      body,
+      #app,
+      #cesiumContainer {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #000;
+      }
+
+      .lil-gui {
+        top: 10px;
+        left: 10px;
+        z-index: 999;
+      }
+
+      .status-panel {
+        position: absolute;
+        left: 10px;
+        bottom: 10px;
+        z-index: 998;
+        min-width: 300px;
+        max-width: calc(100vw - 40px);
+        padding: 10px 12px;
+        border-radius: 6px;
+        color: #e8f1ff;
+        background: rgba(12, 18, 28, 0.78);
+        font-size: 13px;
+        line-height: 1.7;
+        pointer-events: none;
+        white-space: pre-line;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="cesiumContainer"></div>
+      <div class="status-panel">{{ statusText }}</div>
+    </div>
+
+    <script type="module">
+      const { createApp } = Vue;
+
+      import GUI from "https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.esm.js";
+      import DrawManager from "./js/DrawManager.js";
+
+      class Flat {
+        constructor(tileset, options = {}) {
+          this.tileset = tileset;
+          this.flatHeight = options.flatHeight ?? 20;
+          this.center = tileset.boundingSphere.center.clone();
+          this.matrix = Cesium.Transforms.eastNorthUpToFixedFrame(this.center);
+          this.localMatrix = Cesium.Matrix4.inverse(
+            this.matrix,
+            new Cesium.Matrix4(),
+          );
+          this.regionList = [];
+          this.localPositionsArr = [];
+        }
+
+        addRegion({ positions, height, id }) {
+          this.flatHeight = height ?? this.flatHeight;
+          this.regionList.push({
+            positions,
+            height: this.flatHeight,
+            id: id ?? `${Date.now()}-${Math.random()}`,
+          });
+          this.updateShader();
+        }
+
+        setHeight(height) {
+          this.flatHeight = height;
+          this.regionList.forEach((region) => {
+            region.height = height;
+          });
+          this.updateShader();
+        }
+
+        removeRegionById(id) {
+          this.regionList = this.regionList.filter((region) => region.id !== id);
+          this.updateShader();
+        }
+
+        updateShader() {
+          this.localPositionsArr = this.regionList.map((region) =>
+            this.cartesiansToLocal(region.positions),
+          );
+
+          if (!this.localPositionsArr.length) {
+            this.tileset.customShader = undefined;
+            return;
+          }
+
+          const polygonFunction = this.getPolygonFunctions();
+          const polygonChecks = this.getPolygonChecks();
+          this.tileset.customShader = new Cesium.CustomShader({
+            uniforms: {
+              u_tileset_localToWorldMatrix: {
+                type: Cesium.UniformType.MAT4,
+                value: this.matrix,
+              },
+              u_tileset_worldToLocalMatrix: {
+                type: Cesium.UniformType.MAT4,
+                value: this.localMatrix,
+              },
+              u_flatHeight: {
+                type: Cesium.UniformType.FLOAT,
+                value: this.flatHeight,
+              },
+            },
+            vertexShaderText: `
+              ${polygonFunction}
+              void vertexMain(VertexInput vsInput, inout czm_modelVertexOutput vsOutput) {
+                vec3 modelMC = vsInput.attributes.positionMC;
+                vec4 modelLocalPosition = vec4(modelMC, 1.0);
+                vec4 tilesetLocalPosition =
+                  u_tileset_worldToLocalMatrix * czm_model * modelLocalPosition;
+                vec2 position2D = tilesetLocalPosition.xy;
+                float groundZ = u_flatHeight;
+                ${polygonChecks}
+              }
+            `,
+          });
+        }
+
+        getPolygonFunctions() {
+          const lengths = [...new Set(this.localPositionsArr.map((polygon) => polygon.length))];
+          return lengths
+            .map(
+              (length) => `
+                vec2 flattenPoints${length}[${length}];
+                bool isPointInPolygon${length}(vec2 point) {
+                  int crossings = 0;
+                  const int count = ${length};
+                  for (int i = 0; i < count; i++) {
+                    vec2 p1 = flattenPoints${length}[i];
+                    vec2 p2 = flattenPoints${length}[int(mod(float(i + 1), float(count)))];
+                    if (p1.y == p2.y || point.y < min(p1.y, p2.y) || point.y >= max(p1.y, p2.y)) {
+                      continue;
+                    }
+                    float x = p1.x + ((point.y - p1.y) * (p2.x - p1.x)) / (p2.y - p1.y);
+                    if (x > point.x) crossings++;
+                  }
+                  return int(mod(float(crossings), 2.0)) == 1;
+                }
+              `,
+            )
+            .join("\n");
+        }
+
+        getPolygonChecks() {
+          return this.localPositionsArr
+            .map((polygon) => {
+              const points = polygon
+                .map(
+                  ([x, y], index) =>
+                    `flattenPoints${polygon.length}[${index}] = vec2(${x.toFixed(6)}, ${y.toFixed(6)});`,
+                )
+                .join("\n");
+              return `
+                ${points}
+                if (isPointInPolygon${polygon.length}(position2D)) {
+                  vec4 flattenedLocalPosition = vec4(
+                    tilesetLocalPosition.x,
+                    tilesetLocalPosition.y,
+                    groundZ,
+                    1.0
+                  );
+                  vec4 modelLocalPositionTransformed =
+                    czm_inverseModel * u_tileset_localToWorldMatrix * flattenedLocalPosition;
+                  vsOutput.positionMC.xy = modelLocalPositionTransformed.xy;
+                  vsOutput.positionMC.z = modelLocalPositionTransformed.z + modelMC.z * 0.002;
+                  return;
+                }
+              `;
+            })
+            .join("\n");
+        }
+
+        cartesiansToLocal(positions) {
+          return positions.map((position) => {
+            const local = Cesium.Matrix4.multiplyByPoint(
+              this.localMatrix,
+              position,
+              new Cesium.Cartesian3(),
+            );
+            return [local.x, local.y];
+          });
+        }
+
+        destroy() {
+          this.tileset.customShader = undefined;
+          this.regionList = [];
+          this.localPositionsArr = [];
+        }
+      }
+
+      createApp({
+        data() {
+          return {
+            viewer: null,
+            imageryLayer: null,
+            tileset: null,
+            flatTool: null,
+            drawManager: null,
+            regionId: null,
+            polygonEntity: null,
+            myLilGui: null,
+            regionLonLats: [],
+            modelCenterHeight: 0,
+            params: {
+              height: 20,
+              showRegion: true,
+              showTileset: true,
+            },
+            statusText: "正在初始化 Cesium…",
+          };
+        },
+
+        async mounted() {
+          this.initMap();
+          this.initDrawManager();
+          this.initGui();
+          await this.loadTileset();
+        },
+
+        beforeUnmount() {
+          if (this.drawManager) this.drawManager.destroy();
+          if (this.myLilGui) this.myLilGui.destroy();
+          if (this.flatTool) this.flatTool.destroy();
+          if (this.polygonEntity) this.viewer.entities.remove(this.polygonEntity);
+          if (this.viewer) this.viewer.destroy();
+        },
+
+        methods: {
+          initMap() {
+            const viewer = new Cesium.Viewer("cesiumContainer", {
+              baseLayer: false,
+              animation: false,
+              timeline: false,
+              fullscreenButton: false,
+              infoBox: false,
+              geocoder: false,
+              homeButton: false,
+              sceneModePicker: false,
+              baseLayerPicker: false,
+              navigationHelpButton: false,
+              selectionIndicator: false,
+              shouldAnimate: true,
+            });
+
+            viewer.scene.globe.depthTestAgainstTerrain = true;
+            viewer._cesiumWidget._creditContainer.style.display = "none";
+
+            this.imageryLayer = viewer.imageryLayers.addImageryProvider(
+              new Cesium.UrlTemplateImageryProvider({
+                url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                maximumLevel: 18,
+              }),
+            );
+            this.viewer = viewer;
+            this.resetCamera();
+          },
+
+          initDrawManager() {
+            this.drawManager = new DrawManager({
+              viewer: this.viewer,
+              onStatus: (text) => {
+                this.statusText = text;
+              },
+              onDrawComplete: (info) => {
+                if (info.type !== "rectangle") return;
+                this.regionId = info.id;
+                this.regionLonLats = info.lonLats;
+                this.applyFlattening();
+                this.statusText = "矩形绘制完成，已按矩形范围应用压平。";
+              },
+            });
+          },
+
+          async loadTileset() {
+            try {
+              this.statusText = "正在加载 3D Tiles 白模…";
+              this.tileset = await Cesium.Cesium3DTileset.fromUrl(
+                "./data/tileset/baimo/tileset.json",
+                {
+                  maximumScreenSpaceError: 16,
+                  maximumMemoryUsage: 2048,
+                },
+              );
+              this.viewer.scene.primitives.add(this.tileset);
+              await this.viewer.zoomTo(this.tileset);
+              this.createDefaultRegion();
+              this.statusText = "模型加载完成。点击“绘制矩形”选择压平范围。";
+            } catch (error) {
+              console.warn("3D Tiles 加载失败：", error);
+              this.statusText = `3D Tiles 加载失败：${error.message}`;
+            }
+          },
+
+          createDefaultRegion() {
+            const center = this.tileset.boundingSphere.center;
+            const cartographic = Cesium.Cartographic.fromCartesian(center);
+            this.modelCenterHeight = cartographic.height;
+          },
+
+          applyFlattening() {
+            if (!this.tileset || this.regionLonLats.length < 3) return;
+            if (this.flatTool) this.flatTool.destroy();
+
+            const positions = this.regionLonLats.map(([longitude, latitude]) =>
+              Cesium.Cartesian3.fromDegrees(longitude, latitude),
+            );
+            this.flatTool = new Flat(this.tileset, {
+              flatHeight: this.params.height,
+            });
+            this.flatTool.addRegion({
+              positions,
+              height: this.params.height,
+              id: this.regionId,
+            });
+            this.updateRegionEntity();
+          },
+
+          updateHeight() {
+            if (!this.flatTool) return;
+            this.flatTool.setHeight(this.params.height);
+            this.updateRegionEntity();
+          },
+
+          updateRegionEntity() {
+            if (!this.viewer || !this.regionLonLats.length) return;
+            const height = this.modelCenterHeight + this.params.height;
+            const positions = this.regionLonLats.map(([longitude, latitude]) =>
+              Cesium.Cartesian3.fromDegrees(longitude, latitude, height),
+            );
+            if (!this.polygonEntity) {
+              this.polygonEntity = this.viewer.entities.add({
+                id: "flatten-region",
+                polygon: {
+                  hierarchy: new Cesium.PolygonHierarchy(positions),
+                  material: Cesium.Color.CHARTREUSE.withAlpha(0.22),
+                  outline: true,
+                  outlineColor: Cesium.Color.CHARTREUSE,
+                  outlineWidth: 2,
+                  perPositionHeight: true,
+                },
+              });
+            } else {
+              this.polygonEntity.polygon.hierarchy = new Cesium.PolygonHierarchy(positions);
+            }
+            this.polygonEntity.show = this.params.showRegion;
+          },
+
+          clearFlattening() {
+            if (this.flatTool) {
+              this.flatTool.destroy();
+              this.flatTool = null;
+            }
+            if (this.polygonEntity) {
+              this.viewer.entities.remove(this.polygonEntity);
+              this.polygonEntity = null;
+            }
+            this.statusText = "已清除压平效果。点击“重新压平”恢复。";
+          },
+
+          startRectangle() {
+            this.clearFlattening();
+            this.drawManager.startDraw("rectangle");
+          },
+
+          clearAll() {
+            this.clearFlattening();
+            this.drawManager.clearAll();
+            this.regionLonLats = [];
+            this.regionId = null;
+            this.statusText = "已清除绘制范围和压平效果。点击“绘制矩形”重新开始。";
+          },
+
+          toggleRegion(show) {
+            if (this.polygonEntity) this.polygonEntity.show = show;
+            if (this.drawManager) {
+              this.drawManager.shapeEntities.rectangle.forEach(
+                (entity) => (entity.show = show),
+              );
+            }
+          },
+
+          resetCamera() {
+            if (!this.viewer) return;
+            this.viewer.camera.setView({
+              destination: Cesium.Cartesian3.fromDegrees(114.37, 30.5, 8000),
+              orientation: {
+                heading: Cesium.Math.toRadians(0),
+                pitch: Cesium.Math.toRadians(-35),
+                roll: 0,
+              },
+            });
+          },
+
+          flyToTileset() {
+            if (this.tileset) this.viewer.zoomTo(this.tileset);
+          },
+
+          initGui() {
+            this.myLilGui = new GUI({ title: "模型压平" });
+
+            const flattenFolder = this.myLilGui.addFolder("压平控制");
+            flattenFolder
+              .add({ draw: () => this.startRectangle() }, "draw")
+              .name("绘制矩形");
+            flattenFolder
+              .add(this.params, "height", -500, 500, 1)
+              .name("压平高度 (m)")
+              .onChange(() => this.updateHeight());
+            flattenFolder
+              .add({ apply: () => this.applyFlattening() }, "apply")
+              .name("重新压平");
+            flattenFolder
+              .add({ clear: () => this.clearAll() }, "clear")
+              .name("清除全部");
+            flattenFolder
+              .add(this.params, "showRegion")
+              .name("显示压平范围")
+              .onChange((value) => this.toggleRegion(value));
+
+            const viewFolder = this.myLilGui.addFolder("视图");
+            viewFolder
+              .add(this.params, "showTileset")
+              .name("显示模型")
+              .onChange((value) => {
+                if (this.tileset) this.tileset.show = value;
+              });
+            viewFolder.add({ fly: () => this.flyToTileset() }, "fly").name("飞向模型");
+            viewFolder.add({ reset: () => this.resetCamera() }, "reset").name("重置视角");
+
+            const layerFolder = this.myLilGui.addFolder("影像图层");
+            layerFolder.add(this.imageryLayer, "show").name("显示影像");
+            layerFolder
+              .add(this.imageryLayer, "alpha", 0, 1, 0.01)
+              .name("影像透明度");
+          },
+        },
+      }).mount("#app");
+    </script>
+  </body>
+</html>
