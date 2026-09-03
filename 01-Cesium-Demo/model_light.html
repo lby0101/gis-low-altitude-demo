@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cesium 模型与光照调节</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+    <script>
+      window.CESIUM_BASE_URL =
+        "https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/";
+    </script>
+    <link
+      href="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Widgets/widgets.css"
+      rel="stylesheet"
+    />
+    <style>
+      html,
+      body,
+      #app,
+      #cesiumContainer {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #000;
+      }
+
+      .lil-gui {
+        top: 10px;
+        right: 10px;
+        z-index: 999;
+      }
+
+      .toast {
+        position: absolute;
+        bottom: 30px;
+        left: 50%;
+        z-index: 1000;
+        transform: translateX(-50%);
+        padding: 8px 18px;
+        border: 1px solid rgba(168, 85, 247, 0.3);
+        border-radius: 8px;
+        color: #e2e8f0;
+        background: rgba(15, 23, 42, 0.85);
+        backdrop-filter: blur(8px);
+        font-size: 13px;
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity 0.3s;
+      }
+
+      .toast.show {
+        opacity: 1;
+      }
+
+      .status-panel {
+        position: absolute;
+        right: 12px;
+        bottom: 12px;
+        z-index: 998;
+        max-width: min(460px, calc(100vw - 24px));
+        padding: 8px 12px;
+        border: 1px solid rgba(130, 210, 255, 0.25);
+        border-radius: 6px;
+        color: rgba(232, 247, 255, 0.92);
+        background: rgba(8, 20, 32, 0.78);
+        font: 12px/1.6 sans-serif;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="cesiumContainer"></div>
+      <div class="toast" id="toast"></div>
+      <div class="status-panel">{{ statusText }}</div>
+    </div>
+
+    <script type="module">
+      const { createApp } = Vue;
+      import * as Cesium from "https://cdn.jsdelivr.net/npm/cesium@1.140.0/+esm";
+      import GUI from "https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.esm.js";
+
+      const imagerySources = {
+        ESRI影像: {
+          url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        },
+        灰色地图: {
+          url: "https://thematic.geoq.cn/arcgis/rest/services/ChinaOnlineStreetGray/MapServer/tile/{z}/{y}/{x}",
+        },
+      };
+      const imageryNames = Object.keys(imagerySources);
+
+      const materialModeLabels = {
+        none: "原始材质",
+        baimo: "白膜贴图",
+        gradient: "高度渐变",
+      };
+
+      let toastTimer = null;
+      function showToast(message) {
+        const element = document.getElementById("toast");
+        element.textContent = message;
+        element.classList.add("show");
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => element.classList.remove("show"), 2500);
+      }
+
+      createApp({
+        data() {
+          return {
+            viewer: null,
+            imageryLayer: null,
+            tileset: null,
+            myLilGui: null,
+            featureHandler: null,
+            statusText: "正在初始化 Cesium…",
+            state: {
+              imagery: "ESRI影像",
+              material: "none",
+              showTileset: true,
+              modelLight: 1,
+              directionalIntensity: 1,
+              mirror: 1,
+              diffuse: 1,
+              hour: 12,
+              globeLighting: true,
+              shadows: false,
+              showImagery: true,
+              imageryAlpha: 1,
+            },
+          };
+        },
+
+        async mounted() {
+          const viewer = this.initMap();
+          this.buildGui();
+          await this.add3DTileset(viewer);
+        },
+
+        beforeUnmount() {
+          if (this.featureHandler) {
+            this.featureHandler.destroy();
+            this.featureHandler = null;
+          }
+          if (this.myLilGui) {
+            this.myLilGui.destroy();
+            this.myLilGui = null;
+          }
+          if (this.viewer && !this.viewer.isDestroyed()) {
+            this.viewer.destroy();
+          }
+          this.viewer = null;
+          this.tileset = null;
+        },
+
+        methods: {
+          initMap() {
+            const viewer = new Cesium.Viewer("cesiumContainer", {
+              baseLayer: false,
+              animation: false,
+              timeline: false,
+              fullscreenButton: false,
+              infoBox: false,
+              geocoder: false,
+              homeButton: false,
+              sceneModePicker: false,
+              baseLayerPicker: false,
+              navigationHelpButton: false,
+              selectionIndicator: false,
+              shouldAnimate: false,
+            });
+
+            window.viewer = viewer;
+            viewer.scene.debugShowFramesPerSecond = true;
+            viewer.scene.globe.enableLighting = this.state.globeLighting;
+            viewer.scene.globe.depthTestAgainstTerrain = true;
+            viewer.scene.globe.dynamicAtmosphereLighting = true;
+            viewer.scene.globe.dynamicAtmosphereLightingFromSun = true;
+            viewer.scene.fog.enabled = true;
+            viewer.scene.fog.density = 0.00008;
+            viewer.scene.skyAtmosphere.show = true;
+            if (viewer.scene.sun) viewer.scene.sun.show = true;
+            viewer._cesiumWidget._creditContainer.style.display = "none";
+
+            this.imageryLayer = viewer.imageryLayers.addImageryProvider(
+              new Cesium.UrlTemplateImageryProvider({
+                url: imagerySources[this.state.imagery].url,
+                maximumLevel: 18,
+              }),
+            );
+            this.viewer = viewer;
+            this.applyShadows();
+            // this.applyDirectionalLight();
+            return viewer;
+          },
+
+          async add3DTileset(viewer) {
+            try {
+              const tileset = await Cesium.Cesium3DTileset.fromUrl(
+                "./data/tileset/baimo/tileset.json",
+                {
+                  maximumScreenSpaceError: 10,
+                  maximumMemoryUsage: 5120,
+                },
+              );
+              this.tileset = tileset;
+              viewer.scene.primitives.add(tileset);
+              tileset.show = this.state.showTileset;
+              this.applyMaterial(this.state.material, false);
+              this.applyModelLight();
+              this.applyImageBasedLighting();
+              // this.applyDirectionalLight();
+              this.applyTime();
+              this.applyShadows();
+              await viewer.zoomTo(tileset);
+              this.statusText =
+                "模型已加载｜可在右上角面板调节材质、模型亮度、方向光和时间";
+              showToast("3D Tileset 加载成功");
+            } catch (error) {
+              console.error("3D Tileset 加载失败：", error);
+              this.statusText =
+                "3D Tiles 加载失败，请通过 HTTP 服务访问页面并检查资源路径";
+              showToast("3D Tileset 加载失败，请检查资源路径");
+            }
+          },
+
+          switchImagery(name) {
+            const source = imagerySources[name];
+            if (!this.viewer || !source) return;
+            const provider = new Cesium.UrlTemplateImageryProvider({
+              url: source.url,
+            });
+            this.viewer.imageryLayers.removeAll(false);
+            this.imageryLayer = this.viewer.imageryLayers.addImageryProvider(
+              provider,
+              0,
+            );
+            this.imageryLayer.show = this.state.showImagery;
+            this.imageryLayer.alpha = this.state.imageryAlpha;
+            showToast(`底图切换至：${name}`);
+          },
+
+          resetCamera() {
+            if (!this.viewer || !this.tileset) return;
+            this.viewer.zoomTo(this.tileset);
+            showToast("视角已重置");
+          },
+
+          applyMaterial(mode, notify = true) {
+            if (!this.tileset) return;
+            this.tileset.customShader = this.buildShader(mode);
+            if (notify) {
+              showToast(`材质切换至：${materialModeLabels[mode] || mode}`);
+            }
+          },
+
+          buildShader(mode) {
+            const uniforms = {
+              u_modelLight: {
+                type: Cesium.UniformType.FLOAT,
+                value: this.state.modelLight,
+              },
+              u_directionalIntensity: {
+                type: Cesium.UniformType.FLOAT,
+                value: this.state.directionalIntensity,
+              },
+            };
+
+            if (mode === "none") {
+              return new Cesium.CustomShader({
+                uniforms,
+                fragmentShaderText: `
+                  void fragmentMain(
+                    FragmentInput fsInput,
+                    inout czm_modelMaterial material
+                  ) {
+                    material.diffuse *= u_modelLight * u_directionalIntensity;
+                  }`,
+              });
+            }
+
+            if (mode === "baimo") {
+              return new Cesium.CustomShader({
+                uniforms: {
+                  ...uniforms,
+                  u_texture: {
+                    value: new Cesium.TextureUniform({
+                      url: "./data/image/building7.png",
+                    }),
+                    type: Cesium.UniformType.SAMPLER_2D,
+                  },
+                },
+                varyings: { v_normalMC: Cesium.VaryingType.VEC3 },
+                vertexShaderText: `
+                  void vertexMain(
+                    VertexInput vsInput,
+                    inout czm_modelVertexOutput vsOutput
+                  ) {
+                    v_normalMC = vsInput.attributes.normalMC;
+                  }`,
+                fragmentShaderText: `
+                  void fragmentMain(
+                    FragmentInput fsInput,
+                    inout czm_modelMaterial material
+                  ) {
+                    vec3 positionMC = fsInput.attributes.positionMC;
+                    if (dot(vec3(0.0, 0.0, 1.0), v_normalMC) > 0.95) {
+                      material.diffuse = vec3(0.079, 0.107, 0.111);
+                    } else {
+                      float width = 100.0;
+                      float height = 100.0;
+                      float textureX = 0.0;
+                      float dotXAxis = dot(vec3(0.0, 1.0, 0.0), v_normalMC);
+                      if (dotXAxis > 0.52 || dotXAxis < -0.52) {
+                        textureX = mod(positionMC.x, width) / width;
+                      } else {
+                        textureX = mod(positionMC.y, width) / width;
+                      }
+                      float textureY = mod(positionMC.z, height) / height;
+                      material.diffuse = texture(u_texture, vec2(textureX, textureY)).rgb;
+                    }
+                    material.diffuse *= u_modelLight * u_directionalIntensity;
+                  }`,
+              });
+            }
+
+            if (mode === "gradient") {
+              return new Cesium.CustomShader({
+                uniforms,
+                varyings: { v_normalMC: Cesium.VaryingType.VEC3 },
+                vertexShaderText: `
+                  void vertexMain(
+                    VertexInput vsInput,
+                    inout czm_modelVertexOutput vsOutput
+                  ) {
+                    v_normalMC = vsInput.attributes.normalMC;
+                  }`,
+                fragmentShaderText: `
+                  void fragmentMain(
+                    FragmentInput fsInput,
+                    inout czm_modelMaterial material
+                  ) {
+                    float bottomHeight = 560.0;
+                    float topHeight = 750.0;
+                    float currentHeight = fsInput.attributes.positionMC.z;
+                    float heightRatio = clamp(
+                      (currentHeight - bottomHeight) /
+                      (topHeight - bottomHeight),
+                      0.0,
+                      1.0
+                    );
+                    vec3 colorBottom = vec3(0.0, 0.8, 0.0);
+                    vec3 colorTop = vec3(0.8, 0.0, 0.0);
+                    material.diffuse = mix(
+                      colorBottom,
+                      colorTop,
+                      heightRatio
+                    ) * u_modelLight * u_directionalIntensity;
+                  }`,
+              });
+            }
+            return null;
+          },
+
+          applyModelLight() {
+            if (!this.tileset) return;
+            const value = Cesium.Math.clamp(this.state.modelLight, 0, 5);
+            this.state.modelLight = value;
+            if (this.tileset?.lightColor) {
+              Cesium.Cartesian3.fromElements(
+                value,
+                value,
+                value,
+                this.tileset.lightColor,
+              );
+            }
+            this.tileset?.customShader?.setUniform("u_modelLight", value);
+          },
+
+          applyImageBasedLighting() {
+            if (!this.tileset?.imageBasedLighting) return;
+            const mirror = Cesium.Math.clamp(this.state.mirror, 0, 1);
+            const diffuse = Cesium.Math.clamp(this.state.diffuse, 0, 1);
+            this.state.mirror = mirror;
+            this.state.diffuse = diffuse;
+            this.tileset.imageBasedLighting.imageBasedLightingFactor =
+              new Cesium.Cartesian2(mirror, diffuse);
+          },
+
+          applyDirectionalLight() {
+            if (!this.viewer) return;
+            const intensity = Cesium.Math.clamp(
+              this.state.directionalIntensity,
+              0,
+              5,
+            );
+            this.state.directionalIntensity = intensity;
+            const direction = new Cesium.Cartesian3(0, -1, 0);
+            if (this.viewer.scene.light instanceof Cesium.DirectionalLight) {
+              Cesium.Cartesian3.clone(
+                direction,
+                this.viewer.scene.light.direction,
+              );
+              this.viewer.scene.light.color = Cesium.Color.WHITE;
+              this.viewer.scene.light.intensity = intensity;
+            } else {
+              this.viewer.scene.light = new Cesium.DirectionalLight({
+                direction,
+                color: Cesium.Color.WHITE,
+                intensity,
+              });
+            }
+            this.tileset?.customShader?.setUniform(
+              "u_directionalIntensity",
+              intensity,
+            );
+          },
+
+          applyTime() {
+            if (!this.viewer) return;
+            const now = new Date();
+            const localDate = new Date(
+              now.getFullYear(),
+              now.getMonth(),
+              now.getDate(),
+              this.state.hour,
+              0,
+              0,
+            );
+            this.viewer.clock.currentTime =
+              Cesium.JulianDate.fromDate(localDate);
+            this.viewer.clock.shouldAnimate = false;
+          },
+
+          applyShadows() {
+            if (!this.viewer) return;
+            this.viewer.shadows = this.state.shadows;
+            this.viewer.terrainShadows = this.state.shadows
+              ? Cesium.ShadowMode.ENABLED
+              : Cesium.ShadowMode.DISABLED;
+          },
+
+          applyGlobeLighting() {
+            if (!this.viewer) return;
+            this.viewer.scene.globe.enableLighting = this.state.globeLighting;
+          },
+
+          setPreset(hour) {
+            this.viewer.scene.light = new Cesium.SunLight();
+
+            this.state.hour = hour;
+            this.applyTime();
+            this.updateGuiDisplays();
+            showToast(`时间已设置为 ${String(hour).padStart(2, "0")}:00`);
+          },
+
+          resetLighting() {
+            Object.assign(this.state, {
+              modelLight: 1,
+              directionalIntensity: 1,
+              mirror: 1,
+              diffuse: 1,
+              hour: 12,
+              globeLighting: true,
+              shadows: false,
+            });
+            this.applyModelLight();
+            this.applyImageBasedLighting();
+            // this.applyDirectionalLight();
+            this.applyTime();
+            this.applyGlobeLighting();
+            this.applyShadows();
+            this.updateGuiDisplays();
+            showToast("光照参数已重置");
+          },
+
+          updateGuiDisplays() {
+            if (!this.myLilGui) return;
+            this.myLilGui.controllersRecursive().forEach((controller) => {
+              controller.updateDisplay();
+            });
+          },
+
+          buildGui() {
+            const gui = new GUI({ title: "模型与光照调节" });
+            this.myLilGui = gui;
+
+            gui
+              .add(this.state, "imagery", imageryNames)
+              .name("底图")
+              .onChange((name) => this.switchImagery(name));
+
+            const modelFolder = gui.addFolder("模型与材质");
+            modelFolder
+              .add(this.state, "material", {
+                原始材质: "none",
+                白膜贴图: "baimo",
+                高度渐变: "gradient",
+              })
+              .name("材质")
+              .onChange((mode) => this.applyMaterial(mode));
+            modelFolder
+              .add(this.state, "showTileset")
+              .name("显示模型")
+              .onChange((show) => {
+                if (this.tileset) this.tileset.show = show;
+              });
+            modelFolder
+              .add(this.state, "modelLight", 0, 5, 0.05)
+              .name("模型亮度")
+              .onChange(() => this.applyModelLight());
+            modelFolder
+              .add(this.state, "mirror", 0, 1, 0.01)
+              .name("镜面反射")
+              .onChange(() => this.applyImageBasedLighting());
+            modelFolder
+              .add(this.state, "diffuse", 0, 1, 0.01)
+              .name("漫反射")
+              .onChange(() => this.applyImageBasedLighting());
+
+            const lightFolder = gui.addFolder("方向光");
+            lightFolder
+              .add(this.state, "directionalIntensity", 0, 5, 0.05)
+              .name("光强度")
+              .onChange(() => this.applyDirectionalLight());
+
+            const timeFolder = gui.addFolder("时间与阴影");
+            timeFolder
+              .add(this.state, "hour", 0, 23, 1)
+              .name("时间(小时)")
+              .onChange(() => this.applyTime());
+            timeFolder
+              .add(this.state, "globeLighting")
+              .name("昼夜光照")
+              .onChange(() => this.applyGlobeLighting());
+            timeFolder
+              .add(this.state, "shadows")
+              .name("开启阴影")
+              .onChange(() => this.applyShadows());
+            timeFolder
+              .add({ morning: () => this.setPreset(8) }, "morning")
+              .name("早晨 08:00");
+            timeFolder
+              .add({ noon: () => this.setPreset(12) }, "noon")
+              .name("中午 12:00");
+            timeFolder
+              .add({ evening: () => this.setPreset(16) }, "evening")
+              .name("傍晚 16:00");
+            timeFolder
+              .add({ midnight: () => this.setPreset(0) }, "midnight")
+              .name("午夜 00:00");
+
+            const layerFolder = gui.addFolder("图层控制");
+            layerFolder
+              .add(this.state, "showImagery")
+              .name("影像图层")
+              .onChange((show) => {
+                if (this.imageryLayer) this.imageryLayer.show = show;
+              });
+            layerFolder
+              .add(this.state, "imageryAlpha", 0, 1, 0.01)
+              .name("影像透明度")
+              .onChange((alpha) => {
+                if (this.imageryLayer) this.imageryLayer.alpha = alpha;
+              });
+
+            gui
+              .add({ reset: () => this.resetLighting() }, "reset")
+              .name("重置光照");
+            gui
+              .add({ camera: () => this.resetCamera() }, "camera")
+              .name("重置视角");
+          },
+        },
+      }).mount("#app");
+    </script>
+  </body>
+</html>
