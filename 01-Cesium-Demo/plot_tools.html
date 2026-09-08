@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cesium 标绘工具</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+    <script>
+      window.CESIUM_BASE_URL =
+        "https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/";
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Cesium.js"></script>
+    <link
+      href="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Widgets/widgets.css"
+      rel="stylesheet"
+    />
+    <style>
+      html,
+      body,
+      #app,
+      #cesiumContainer {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #07111d;
+        font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+      }
+
+      .lil-gui {
+        top: 10px;
+        left: 10px;
+        right: auto;
+        z-index: 999;
+        --width: 290px;
+      }
+
+      .status-panel {
+        position: absolute;
+        left: 10px;
+        bottom: 10px;
+        z-index: 998;
+        max-width: min(460px, calc(100vw - 20px));
+        padding: 10px 14px;
+        border: 1px solid rgba(132, 198, 235, 0.28);
+        border-radius: 7px;
+        color: #e8f4ff;
+        background: rgba(8, 20, 34, 0.82);
+        box-shadow: 0 5px 18px rgba(0, 0, 0, 0.22);
+        font-size: 13px;
+        line-height: 1.7;
+        pointer-events: none;
+        white-space: pre-line;
+      }
+
+      .title-panel {
+        position: absolute;
+        top: 12px;
+        right: 12px;
+        z-index: 2;
+        padding: 10px 14px;
+        border: 1px solid rgba(127, 202, 244, 0.25);
+        border-radius: 8px;
+        color: #e8f7ff;
+        background: rgba(7, 19, 33, 0.74);
+        pointer-events: none;
+      }
+
+      .title-panel h1 {
+        margin: 0;
+        font-size: 16px;
+        letter-spacing: 0.08em;
+      }
+
+      .title-panel p {
+        margin: 4px 0 0;
+        color: #91b4c9;
+        font-size: 11px;
+      }
+
+      /* PlotManager 创建的右键编辑菜单。 */
+      .context-root {
+        position: absolute;
+        z-index: 1000;
+        display: none;
+        min-width: 128px;
+        color: #e7f5ff;
+        font-size: 13px;
+      }
+
+      .context-ul {
+        margin: 0;
+        padding: 4px 0;
+        border: 1px solid rgba(124, 191, 227, 0.36);
+        border-radius: 5px;
+        background: rgba(12, 27, 44, 0.96);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+        list-style: none;
+      }
+
+      .context-menu {
+        position: relative;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .context-item,
+      .context-item-disabled {
+        display: block;
+        padding: 7px 13px;
+        color: inherit;
+        text-decoration: none;
+        white-space: nowrap;
+        cursor: pointer;
+      }
+
+      .context-item:hover {
+        background: rgba(45, 139, 194, 0.65);
+      }
+
+      .context-item-disabled {
+        color: #6f8492;
+        cursor: default;
+      }
+
+      .context-item i {
+        width: 17px;
+        margin-right: 4px;
+      }
+
+      .context-submenu {
+        position: absolute;
+        top: 0;
+        left: 100%;
+        display: none;
+      }
+
+      @media (max-width: 640px) {
+        .title-panel {
+          display: none;
+        }
+
+        .lil-gui {
+          --width: 245px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="cesiumContainer"></div>
+      <div class="title-panel">
+        <h1>Cesium 标绘工具</h1>
+        <p>点、线、面与战术箭头 · 右键图形可编辑或删除</p>
+      </div>
+      <div class="status-panel">{{ statusText }}</div>
+    </div>
+
+    <script type="module">
+      const { createApp } = Vue;
+      import GUI from "https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.esm.js";
+      import { PlotManager, PointPlot, PlotType } from "./js/PlotManager.js";
+
+      const TYPE_NAMES = {
+        point: "点",
+        label: "文字",
+        billboard: "标记",
+        model: "模型",
+        polyline: "折线",
+        polygon: "多边形",
+        straightarrow: "直箭头",
+        attackarrow: "攻击箭头",
+        doublearrow: "钳箭头",
+      };
+
+      createApp({
+        data() {
+          return {
+            viewer: null,
+            myLilGui: null,
+            myPlotManager: null,
+            statusText:
+              "请选择一种标绘类型。点/文字/标记/模型单击落点；线、面、箭头左键取点，右键结束。",
+            removeContextMenuHandler: null,
+          };
+        },
+
+        mounted() {
+          this.initMap();
+          this.initPlotManager();
+          this.addLilGui();
+        },
+
+        beforeUnmount() {
+          if (this.removeContextMenuHandler) {
+            this.removeContextMenuHandler();
+            this.removeContextMenuHandler = null;
+          }
+          if (this.myPlotManager) {
+            this.myPlotManager.destroy();
+            this.myPlotManager = null;
+          }
+          if (this.myLilGui) {
+            this.myLilGui.destroy();
+            this.myLilGui = null;
+          }
+          if (this.viewer && !this.viewer.isDestroyed()) {
+            this.viewer.destroy();
+            this.viewer = null;
+          }
+        },
+
+        methods: {
+          initMap() {
+            const viewer = new Cesium.Viewer("cesiumContainer", {
+              baseLayer: false,
+              animation: false,
+              timeline: false,
+              fullscreenButton: false,
+              infoBox: false,
+              geocoder: false,
+              homeButton: false,
+              sceneModePicker: false,
+              baseLayerPicker: false,
+              navigationHelpButton: false,
+              selectionIndicator: false,
+              shouldAnimate: true,
+            });
+
+            this.viewer = viewer;
+            window.viewer = viewer;
+            viewer.scene.debugShowFramesPerSecond = true;
+            viewer.scene.globe.enableLighting = true;
+            // 标绘对象始终显示在地形之上；点/标签/图标另以 disableDepthTestDistance 兜底。
+            viewer.scene.globe.depthTestAgainstTerrain = false;
+            viewer.scene.fog.enabled = true;
+            viewer.scene.fog.density = 0.00008;
+            viewer.scene.skyAtmosphere.show = true;
+            viewer.scene.postProcessStages.fxaa.enabled = true;
+            viewer.cesiumWidget.creditContainer.style.display = "none";
+
+            viewer.imageryLayers.addImageryProvider(
+              new Cesium.UrlTemplateImageryProvider({
+                url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                maximumLevel: 18,
+              }),
+            );
+
+            // 绘制期间右键用于结束，不显示浏览器默认菜单。
+            const canvas = viewer.scene.canvas;
+            const preventContextMenu = (event) => event.preventDefault();
+            canvas.addEventListener("contextmenu", preventContextMenu);
+            this.removeContextMenuHandler = () =>
+              canvas.removeEventListener("contextmenu", preventContextMenu);
+
+            this.resetCamera();
+          },
+
+          initPlotManager() {
+            const pointStyle = {
+              color: Cesium.Color.fromCssColorString("#ff5364"),
+              pixelSize: 10,
+              outlineColor: Cesium.Color.WHITE,
+              outlineWidth: 3,
+              heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+              disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            };
+            const labelStyle = {
+              font: "20px Microsoft YaHei",
+              fillColor: Cesium.Color.WHITE,
+              showBackground: true,
+              backgroundColor: Cesium.Color.fromCssColorString(
+                "rgba(11, 35, 55, 0.82)",
+              ),
+              style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+              verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+              pixelOffset: new Cesium.Cartesian2(8, -8),
+              disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            };
+            const billboardStyle = {
+              image: "./data/plot/marker.png",
+              width: 42,
+              height: 42,
+              verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+              heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+              disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            };
+            const modelStyle = {
+              uri: "./data/plot/Wood_Tower.gltf",
+              // 点选到有效坐标前先隐藏模型，避免零坐标进入 ModelVisualizer。
+              show: false,
+              scale: 1,
+              minimumPixelSize: 42,
+              maximumScale: 300,
+              // 场景关闭地形深度测试后，模型无需地形贴地处理也不会被遮挡。
+              heightReference: Cesium.HeightReference.NONE,
+              colorBlendMode: Cesium.ColorBlendMode.HIGHLIGHT,
+            };
+            const polylineStyle = {
+              clampToGround: true,
+              material: Cesium.Color.fromCssColorString("#ffe36e"),
+              width: 4,
+            };
+            const arrowStyle = {
+              material: Cesium.Color.fromCssColorString(
+                "rgba(45, 157, 255, 0.36)",
+              ),
+              outline: true,
+              outlineColor: Cesium.Color.fromCssColorString("#4de4ff"),
+              outlineWidth: 3,
+              // 动态箭头避免走 GroundPrimitive Worker，防止几何对象无法克隆。
+              heightReference: Cesium.HeightReference.NONE,
+              perPositionHeight: true,
+            };
+            const polygonStyle = {
+              material: Cesium.Color.fromCssColorString(
+                "rgba(45, 157, 255, 0.36)",
+              ),
+              outline: true,
+              outlineColor: Cesium.Color.fromCssColorString("#4de4ff"),
+              outlineWidth: 3,
+              heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+            };
+
+            this.arrowStyle = arrowStyle;
+            const manager = new PlotManager(this.viewer, {
+              pointStyle,
+              labelStyle,
+              billboardStyle,
+              modelStyle,
+              polylineStyle,
+              polygonStyle,
+              contextEnabled: true,
+              showTip: true,
+            });
+            this.myPlotManager = manager;
+
+            manager.postCreate.addEventListener((graphic) => {
+              this.statusText = `${TYPE_NAMES[graphic.type] || "图形"}已创建。右键图形可开始编辑、删除。`;
+            });
+            manager.postEdit.addEventListener((graphic) => {
+              this.statusText = `${TYPE_NAMES[graphic.type] || "图形"}编辑完成。`;
+            });
+          },
+
+          addLilGui() {
+            const manager = this.myPlotManager;
+            const gui = new GUI({ title: "标绘工具" });
+            this.myLilGui = gui;
+
+            const drawFolder = gui.addFolder("创建标绘");
+            drawFolder
+              .add({ draw: () => this.pick(PlotType.POINT) }, "draw")
+              .name("画点");
+            drawFolder
+              .add({ draw: () => this.pickLabelPoint() }, "draw")
+              .name("带 label 的点");
+            drawFolder
+              .add({ draw: () => this.pick(PlotType.LABEL) }, "draw")
+              .name("文字");
+            drawFolder
+              .add({ draw: () => this.pick(PlotType.BILLBOARD) }, "draw")
+              .name("标记");
+            drawFolder
+              .add({ draw: () => this.pick(PlotType.MODEL) }, "draw")
+              .name("模型");
+            drawFolder
+              .add({ draw: () => this.pick(PlotType.POLYLINE) }, "draw")
+              .name("画线");
+            drawFolder
+              .add({ draw: () => this.pick(PlotType.POLYGON) }, "draw")
+              .name("画多边形");
+            drawFolder
+              .add({ draw: () => this.pick(PlotType.STRAIGHTARROW) }, "draw")
+              .name("直箭头");
+            drawFolder
+              .add({ draw: () => this.pick(PlotType.ATTACKARROW) }, "draw")
+              .name("攻击箭头");
+            drawFolder
+              .add({ draw: () => this.pick(PlotType.DOUBLEARROW) }, "draw")
+              .name("钳箭头");
+            drawFolder
+              .add({ clear: () => this.clearAll() }, "clear")
+              .name("清空全部");
+
+            const viewFolder = gui.addFolder("视图");
+            viewFolder
+              .add({ reset: () => this.resetCamera() }, "reset")
+              .name("重置视角");
+            viewFolder
+              .add({ fly: () => this.flyToFirstGraphic() }, "fly")
+              .name("飞到第一个图形");
+          },
+
+          pick(type) {
+            if (!this.myPlotManager) return;
+            const name = TYPE_NAMES[type] || "图形";
+            this.statusText =
+              type === PlotType.POINT ||
+              type === PlotType.LABEL ||
+              type === PlotType.BILLBOARD ||
+              type === PlotType.MODEL
+                ? `正在创建${name}，请在地图上单击落点。`
+                : `正在创建${name}，左键逐点取点，右键结束。`;
+            try {
+              const style = PlotType.isArrow(type) ? this.arrowStyle : undefined;
+              const graphic = this.myPlotManager.pick(type, style);
+              if (type === PlotType.POINT) {
+                graphic.properties = { name: "point" };
+              }
+              if (type === PlotType.LABEL) {
+                graphic.text = "中国";
+              }
+              if (type === PlotType.BILLBOARD) {
+                graphic.text = "标记点";
+              }
+              return graphic;
+            } catch (error) {
+              console.error("创建标绘失败：", error);
+              this.statusText = `创建${name}失败：${error.message || error}`;
+            }
+          },
+
+          pickLabelPoint() {
+            if (!this.myPlotManager) return;
+            this.statusText = "正在创建带 label 的点，请在地图上单击落点。";
+            try {
+              const point = this.myPlotManager.pick(PlotType.POINT);
+              point.properties = { name: "point-with-label" };
+              point.text = "这是一个点";
+              return point;
+            } catch (error) {
+              console.error("创建带文字的点失败：", error);
+              this.statusText = `创建带文字的点失败：${error.message || error}`;
+            }
+          },
+
+          clearAll() {
+            if (!this.myPlotManager) return;
+            this.myPlotManager.removeAll();
+            this.statusText = "已清空所有标绘。请选择一种类型开始绘制。";
+          },
+
+          flyToFirstGraphic() {
+            if (!this.myPlotManager || !this.myPlotManager.get(0)) {
+              this.statusText = "尚未创建图形。";
+              return;
+            }
+            this.myPlotManager.zoomTo(this.myPlotManager.get(0));
+          },
+
+          resetCamera() {
+            if (!this.viewer) return;
+            this.viewer.camera.setView({
+              destination: Cesium.Cartesian3.fromDegrees(114.32, 30.57, 10000),
+              orientation: {
+                heading: Cesium.Math.toRadians(0),
+                pitch: Cesium.Math.toRadians(-50),
+                roll: 0,
+              },
+            });
+          },
+        },
+      }).mount("#app");
+    </script>
+  </body>
+</html>
