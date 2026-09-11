@@ -1,0 +1,1129 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cesium 模拟驾驶游戏</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+    <script>
+      window.CESIUM_BASE_URL =
+        "https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/";
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Cesium.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@turf/turf@7.2.0/turf.min.js"></script>
+    <link
+      href="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Widgets/widgets.css"
+      rel="stylesheet"
+    />
+    <style>
+      html,
+      body,
+      #app,
+      #cesiumContainer {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #050b14;
+        font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+      }
+
+      .hud {
+        position: absolute;
+        inset: 0;
+        z-index: 5;
+        pointer-events: none;
+      }
+
+      .title-panel,
+      .help-panel,
+      .status-panel,
+      .speed-panel,
+      .drive-control,
+      .hud-button {
+        pointer-events: auto;
+      }
+
+      .title-panel {
+        position: absolute;
+        top: 16px;
+        left: 16px;
+        padding: 12px 16px;
+        color: #eff8ff;
+        background: rgba(8, 20, 35, 0.78);
+        border: 1px solid rgba(122, 213, 255, 0.28);
+        border-radius: 10px;
+        box-shadow: 0 8px 28px rgba(0, 0, 0, 0.24);
+        backdrop-filter: blur(10px);
+      }
+
+      .title-panel h1 {
+        margin: 0;
+        font-size: 18px;
+        letter-spacing: 0.08em;
+      }
+
+      .title-panel p {
+        margin: 5px 0 0;
+        color: #91b4c9;
+        font-size: 12px;
+      }
+
+      .speed-panel {
+        position: absolute;
+        top: 18px;
+        left: 50%;
+        min-width: 188px;
+        padding: 9px 18px 11px;
+        color: #a8f5ff;
+        background: rgba(2, 15, 28, 0.72);
+        border: 1px solid rgba(71, 226, 255, 0.36);
+        border-radius: 12px;
+        box-shadow: 0 0 26px rgba(0, 184, 255, 0.12);
+        transform: translateX(-50%);
+        text-align: center;
+        pointer-events: none;
+      }
+
+      .speed-label {
+        display: block;
+        color: #83a9bb;
+        font-size: 11px;
+        letter-spacing: 0.18em;
+      }
+
+      .speed-value {
+        color: #64ffb1;
+        font:
+          700 42px/1.05 Consolas,
+          "Fira Code",
+          monospace;
+        text-shadow: 0 0 12px rgba(57, 255, 164, 0.5);
+      }
+
+      .speed-unit {
+        margin-left: 7px;
+        color: #8fe7e8;
+        font-size: 12px;
+      }
+
+      .help-panel {
+        position: absolute;
+        top: 16px;
+        right: 16px;
+        width: 198px;
+        padding: 12px 14px;
+        color: #d9ebf5;
+        background: rgba(8, 20, 35, 0.76);
+        border: 1px solid rgba(150, 205, 232, 0.2);
+        border-radius: 10px;
+        backdrop-filter: blur(10px);
+        font-size: 12px;
+        line-height: 1.75;
+      }
+
+      .help-panel strong {
+        color: #70dcff;
+        font-size: 13px;
+      }
+
+      .help-panel kbd {
+        display: inline-block;
+        min-width: 22px;
+        margin: 0 2px;
+        padding: 0 4px;
+        color: #efffff;
+        background: rgba(255, 255, 255, 0.12);
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 3px;
+        text-align: center;
+        font:
+          11px/18px Consolas,
+          monospace;
+      }
+
+      .status-panel {
+        position: absolute;
+        bottom: 18px;
+        left: 18px;
+        max-width: min(430px, calc(100vw - 36px));
+        padding: 9px 13px;
+        color: #d6e8f2;
+        background: rgba(7, 18, 30, 0.76);
+        border: 1px solid rgba(134, 202, 228, 0.22);
+        border-radius: 7px;
+        backdrop-filter: blur(8px);
+        font-size: 12px;
+        line-height: 1.6;
+      }
+
+      .status-panel .status-dot {
+        display: inline-block;
+        width: 7px;
+        height: 7px;
+        margin-right: 7px;
+        border-radius: 50%;
+        background: #49efaa;
+        box-shadow: 0 0 8px #49efaa;
+      }
+
+      .status-panel .status-dot.error {
+        background: #ff7373;
+        box-shadow: 0 0 8px #ff7373;
+      }
+
+      .drive-control {
+        position: absolute;
+        right: 22px;
+        bottom: 18px;
+        color: #f5fbff;
+        user-select: none;
+      }
+
+      .btns-line {
+        display: flex;
+        align-items: center;
+      }
+
+      .drive-key {
+        display: flex;
+        width: 54px;
+        height: 54px;
+        margin: 5px;
+        align-items: center;
+        justify-content: center;
+        color: #dff9ff;
+        background: rgba(33, 61, 80, 0.86);
+        border: 1px solid rgba(137, 221, 255, 0.3);
+        border-radius: 9px;
+        box-shadow: 0 5px 13px rgba(0, 0, 0, 0.28);
+        cursor: pointer;
+        font-size: 25px;
+        transition:
+          background 0.12s,
+          transform 0.12s,
+          border-color 0.12s;
+        touch-action: none;
+      }
+
+      .drive-key:hover {
+        background: rgba(43, 98, 127, 0.92);
+      }
+
+      .drive-key.active {
+        background: #087bc4;
+        border-color: #8ce8ff;
+        box-shadow: 0 0 18px rgba(0, 183, 255, 0.48);
+        transform: translateY(2px);
+      }
+
+      .drive-key.up {
+        margin-left: 69px;
+        transform: rotate(-90deg);
+      }
+
+      .drive-key.up.active {
+        transform: rotate(-90deg) translateY(2px);
+      }
+
+      .drive-key.down {
+        transform: rotate(90deg);
+      }
+
+      .drive-key.down.active {
+        transform: rotate(90deg) translateY(2px);
+      }
+
+      .drive-key.left {
+        transform: rotate(180deg);
+      }
+
+      .drive-key.left.active {
+        transform: rotate(180deg) translateY(2px);
+      }
+
+      .drive-key.right {
+        transform: none;
+      }
+
+      .drive-key.right.active {
+        transform: translateY(2px);
+      }
+
+      .toolbar {
+        position: absolute;
+        right: 22px;
+        bottom: 157px;
+        display: flex;
+        gap: 8px;
+      }
+
+      .hud-button {
+        padding: 7px 11px;
+        color: #d9f5ff;
+        background: rgba(11, 34, 52, 0.82);
+        border: 1px solid rgba(127, 218, 255, 0.3);
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 12px;
+      }
+
+      .hud-button:hover {
+        background: rgba(15, 77, 108, 0.9);
+      }
+
+      @media (max-width: 640px) {
+        .title-panel {
+          top: 10px;
+          left: 10px;
+        }
+
+        .title-panel p,
+        .help-panel {
+          display: none;
+        }
+
+        .speed-panel {
+          top: 10px;
+          min-width: 145px;
+          padding: 6px 10px 8px;
+        }
+
+        .speed-value {
+          font-size: 32px;
+        }
+
+        .drive-control,
+        .toolbar {
+          right: 9px;
+        }
+
+        .drive-key {
+          width: 48px;
+          height: 48px;
+          margin: 4px;
+        }
+
+        .drive-key.up {
+          margin-left: 60px;
+          transform: rotate(-90deg);
+        }
+
+        .drive-key.up.active {
+          transform: rotate(-90deg) translateY(2px);
+        }
+
+        .toolbar {
+          bottom: 145px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="cesiumContainer"></div>
+      <div class="hud">
+        <div class="title-panel">
+          <h1>模拟驾驶</h1>
+          <p>Cesium Entity + 第一人称跟随视角</p>
+        </div>
+
+        <div class="speed-panel">
+          <span class="speed-label">CURRENT SPEED</span>
+          <span id="speed-value" class="speed-value">0.0</span>
+          <span class="speed-unit">KM/H</span>
+        </div>
+
+        <div class="help-panel">
+          <strong>驾驶控制</strong><br />
+          <kbd>↑</kbd> 加速前进　<kbd>↓</kbd> 倒车<br />
+          <kbd>←</kbd><kbd>→</kbd> 转向<br />
+          松开按键后车辆会自然减速
+        </div>
+
+        <div class="toolbar">
+          <button class="hud-button" type="button" @click="resetCamera">
+            重置视角
+          </button>
+          <button class="hud-button" type="button" @click="toggleFollow">
+            {{ followText }}
+          </button>
+          <button class="hud-button" type="button" @click="resetCar">
+            重置车辆
+          </button>
+        </div>
+
+        <div class="status-panel">
+          <span class="status-dot" :class="{ error: hasError }"></span>{{
+          statusText }}
+        </div>
+
+        <div class="drive-control" aria-label="驾驶方向控制">
+          <button
+            class="drive-key up"
+            :class="{ active: controlState.up }"
+            type="button"
+            aria-label="前进"
+            @pointerdown="pressControl('up', $event)"
+            @pointerup="releaseControl('up', $event)"
+            @pointercancel="releaseControl('up', $event)"
+            @pointerleave="releaseControl('up', $event)"
+          >
+            ➜
+          </button>
+          <div class="btns-line">
+            <button
+              class="drive-key left"
+              :class="{ active: controlState.left }"
+              type="button"
+              aria-label="左转"
+              @pointerdown="pressControl('left', $event)"
+              @pointerup="releaseControl('left', $event)"
+              @pointercancel="releaseControl('left', $event)"
+              @pointerleave="releaseControl('left', $event)"
+            >
+              ➜
+            </button>
+            <button
+              class="drive-key down"
+              :class="{ active: controlState.down }"
+              type="button"
+              aria-label="后退"
+              @pointerdown="pressControl('down', $event)"
+              @pointerup="releaseControl('down', $event)"
+              @pointercancel="releaseControl('down', $event)"
+              @pointerleave="releaseControl('down', $event)"
+            >
+              ➜
+            </button>
+            <button
+              class="drive-key right"
+              :class="{ active: controlState.right }"
+              type="button"
+              aria-label="右转"
+              @pointerdown="pressControl('right', $event)"
+              @pointerup="releaseControl('right', $event)"
+              @pointercancel="releaseControl('right', $event)"
+              @pointerleave="releaseControl('right', $event)"
+            >
+              ➜
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const { createApp } = Vue;
+      window.CESIUM_BASE_URL =
+        "https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/";
+
+      // 直接迁移 skybox_on_ground.html 中的近地天空盒实现。
+      const BoxGeometry = Cesium.BoxGeometry;
+      const Cartesian3 = Cesium.Cartesian3;
+      const defined = Cesium.defined;
+      const destroyObject = Cesium.destroyObject;
+      const DeveloperError = Cesium.DeveloperError;
+      const GeometryPipeline = Cesium.GeometryPipeline;
+      const Matrix3 = Cesium.Matrix3;
+      const Matrix4 = Cesium.Matrix4;
+      const Transforms = Cesium.Transforms;
+      const VertexFormat = Cesium.VertexFormat;
+      const BufferUsage = Cesium.BufferUsage;
+      const CubeMap = Cesium.CubeMap;
+      const DrawCommand = Cesium.DrawCommand;
+      const loadCubeMap = Cesium.loadCubeMap;
+      const RenderState = Cesium.RenderState;
+      const VertexArray = Cesium.VertexArray;
+      const BlendingState = Cesium.BlendingState;
+      const SceneMode = Cesium.SceneMode;
+      const ShaderProgram = Cesium.ShaderProgram;
+      const ShaderSource = Cesium.ShaderSource;
+      const skyboxMatrix3 = new Matrix3();
+
+      class SkyBoxOnGround {
+        constructor(options) {
+          // 兼容高版本 Cesium：新版中 getRotation 已被移除。
+          if (!Cesium.defined(Cesium.Matrix4.getRotation)) {
+            Cesium.Matrix4.getRotation = Cesium.Matrix4.getMatrix3;
+          }
+          this.sources = options.sources;
+          this._sources = undefined;
+          this.show = options.show === undefined ? true : options.show;
+          this._command = new DrawCommand({
+            modelMatrix: Matrix4.clone(Matrix4.IDENTITY),
+            owner: this,
+          });
+          this._cubeMap = undefined;
+          this._attributeLocations = undefined;
+          this._useHdr = undefined;
+        }
+
+        update(frameState, useHdr) {
+          const that = this;
+          const SkyBoxFS = `#version 300 es
+            precision highp float;
+            uniform samplerCube u_cubeMap;
+            in vec3 v_texCoord;
+            out vec4 fragColor;
+            void main() {
+              vec4 color = texture(u_cubeMap, normalize(v_texCoord));
+              fragColor = vec4(czm_gammaCorrect(color).rgb, czm_morphTime);
+            }`;
+          const SkyBoxVS = `#version 300 es
+            precision highp float;
+            in vec3 position;
+            out vec3 v_texCoord;
+            uniform mat3 u_rotateMatrix;
+            void main() {
+              vec3 p = czm_viewRotation * u_rotateMatrix *
+                (czm_temeToPseudoFixed * (czm_entireFrustum.y * position));
+              gl_Position = czm_projection * vec4(p, 1.0);
+              v_texCoord = position;
+            }`;
+
+          if (!this.show) return undefined;
+          if (
+            frameState.mode !== SceneMode.SCENE3D &&
+            frameState.mode !== SceneMode.MORPHING
+          ) {
+            return undefined;
+          }
+          if (!frameState.passes.render) return undefined;
+
+          const context = frameState.context;
+          if (this._sources !== this.sources) {
+            this._sources = this.sources;
+            const sources = this.sources;
+            if (
+              !defined(sources.positiveX) ||
+              !defined(sources.negativeX) ||
+              !defined(sources.positiveY) ||
+              !defined(sources.negativeY) ||
+              !defined(sources.positiveZ) ||
+              !defined(sources.negativeZ)
+            ) {
+              throw new DeveloperError(
+                "this.sources is required and must have positiveX, negativeX, positiveY, negativeY, positiveZ, and negativeZ properties.",
+              );
+            }
+            if (
+              typeof sources.positiveX !== typeof sources.negativeX ||
+              typeof sources.positiveX !== typeof sources.positiveY ||
+              typeof sources.positiveX !== typeof sources.negativeY ||
+              typeof sources.positiveX !== typeof sources.positiveZ ||
+              typeof sources.positiveX !== typeof sources.negativeZ
+            ) {
+              throw new DeveloperError(
+                "this.sources properties must all be the same type.",
+              );
+            }
+            if (typeof sources.positiveX === "string") {
+              loadCubeMap(context, this._sources).then((cubeMap) => {
+                this._cubeMap = this._cubeMap && this._cubeMap.destroy();
+                this._cubeMap = cubeMap;
+              });
+            } else {
+              this._cubeMap = this._cubeMap && this._cubeMap.destroy();
+              this._cubeMap = new CubeMap({ context, source: sources });
+            }
+          }
+
+          const command = this._command;
+          command.modelMatrix = Transforms.eastNorthUpToFixedFrame(
+            frameState.camera._positionWC,
+          );
+          if (!defined(command.vertexArray)) {
+            command.uniformMap = {
+              u_cubeMap: () => that._cubeMap,
+              u_rotateMatrix: () =>
+                Matrix4.getRotation(command.modelMatrix, skyboxMatrix3),
+            };
+            const geometry = BoxGeometry.createGeometry(
+              BoxGeometry.fromDimensions({
+                dimensions: new Cartesian3(2.0, 2.0, 2.0),
+                vertexFormat: VertexFormat.POSITION_ONLY,
+              }),
+            );
+            const attributeLocations = (this._attributeLocations =
+              GeometryPipeline.createAttributeLocations(geometry));
+            command.vertexArray = VertexArray.fromGeometry({
+              context,
+              geometry,
+              attributeLocations,
+              bufferUsage: BufferUsage.STATIC_DRAW || BufferUsage._DRAW,
+            });
+            command.renderState = RenderState.fromCache({
+              blending: BlendingState.ALPHA_BLEND,
+            });
+          }
+          if (!defined(command.shaderProgram) || this._useHdr !== useHdr) {
+            command.shaderProgram = ShaderProgram.fromCache({
+              context,
+              vertexShaderSource: new ShaderSource({
+                defines: [useHdr ? "HDR" : ""],
+                sources: [SkyBoxVS],
+              }),
+              fragmentShaderSource: new ShaderSource({
+                defines: [useHdr ? "HDR" : ""],
+                sources: [SkyBoxFS],
+              }),
+              attributeLocations: this._attributeLocations,
+            });
+            this._useHdr = useHdr;
+          }
+          return defined(this._cubeMap) ? command : undefined;
+        }
+
+        isDestroyed() {
+          return false;
+        }
+
+        destroy() {
+          const command = this._command;
+          command.vertexArray =
+            command.vertexArray && command.vertexArray.destroy();
+          command.shaderProgram =
+            command.shaderProgram && command.shaderProgram.destroy();
+          this._cubeMap = this._cubeMap && this._cubeMap.destroy();
+          return destroyObject(this);
+        }
+      }
+
+      class SkyBox {
+        constructor(viewer) {
+          this.viewer = viewer;
+        }
+
+        SkyBoxOnGround(options) {
+          const defaultSkyBox = this.viewer.scene.skyBox;
+          const currentSkyBox = new SkyBoxOnGround({
+            sources: options.sources,
+          });
+          const height = !options.height ? "5705" : options.height;
+          this.viewer.scene.postRender.addEventListener(() => {
+            const cameraHeight = Cesium.Cartographic.fromCartesian(
+              this.viewer.camera.position,
+            ).height;
+            if (cameraHeight < height) {
+              this.viewer.scene.skyBox = currentSkyBox;
+              this.viewer.scene.skyAtmosphere.show = false;
+            } else {
+              this.viewer.scene.skyBox = defaultSkyBox;
+              this.viewer.scene.skyAtmosphere.show = true;
+            }
+          });
+        }
+      }
+
+      // 车辆驾驶控制器：车辆使用一个 Cesium Entity，位置和朝向由每帧输入更新。
+      // 车辆高度从 BIM tileset 已加载的瓦片中查询，并逐帧平滑过渡。
+      class DriveSimulation {
+        constructor(viewer, options = {}) {
+          this.viewer = viewer;
+          this.speedElement = document.getElementById(options.speedDom);
+          this.onStatus = options.onStatus || (() => {});
+          this.position = {
+            longitude: options.longitude ?? 118.84137541768871,
+            latitude: options.latitude ?? 34.04253375933433,
+            height: options.height ?? 0,
+          };
+          this.heading = options.heading ?? 33;
+          this.speed = 0;
+          this.maxSpeed = 54;
+          this.acceleration = 17;
+          this.brake = 25;
+          this.turnSpeed = 48;
+          this.keys = { up: false, down: false, left: false, right: false };
+          this.follow = false;
+          this.entity = null;
+          this.surfaceTileset = null;
+          this.targetHeight = this.position.height;
+          this.lastHeightSampleAt = 0;
+          this.heightSampleInterval = 250;
+          this.heightSampleDistance = 0.75;
+          this.heightSmoothingSpeed = 30;
+          this.lastHeightSamplePosition = new Cesium.Cartesian3();
+          this.heightSamplePositionScratch = new Cesium.Cartesian3();
+          this.heightSampleCartographic = new Cesium.Cartographic();
+          this.hasHeightSample = false;
+          this.lastTime = null;
+          this.stopTimer = null;
+          this.removeTick = null;
+          this.removeKeydown = null;
+          this.removeKeyup = null;
+          this.boundBlur = () => this.releaseAll();
+        }
+
+        async startDrive(modelPath, options = {}) {
+          this.heading = options.heading ?? this.heading;
+          this.position.height = options.height ?? this.position.height;
+          this.entity = this.viewer.entities.add({
+            position: Cesium.Cartesian3.fromDegrees(
+              this.position.longitude,
+              this.position.latitude,
+              this.position.height,
+            ),
+            model: {
+              uri: modelPath,
+              scale: options.scale ?? 1,
+              maximumScale: 100,
+              minimumPixelSize: 48,
+              imageBasedLightingFactor: new Cesium.Cartesian2(2, 2),
+            },
+            orientation: this.getOrientation(),
+          });
+
+          this.initEvents();
+          this.removeTick = this.viewer.clock.onTick.addEventListener(
+            (clock) => {
+              this.update(clock.currentTime);
+            },
+          );
+
+          // Entity 模型异步加载时 zoomTo 可能暂时拿不到包围球，
+          // 直接按车辆坐标设置相机，确保页面初始化就定位到汽车。
+          this.viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+          this.updateCamera(this.getCurrentPosition());
+          this.onStatus("车辆已就绪，使用方向键或屏幕按钮开始驾驶。", false);
+        }
+
+        initEvents() {
+          const keyMap = {
+            ArrowUp: "up",
+            ArrowDown: "down",
+            ArrowLeft: "left",
+            ArrowRight: "right",
+          };
+          this.removeKeydown = (event) => {
+            const type = keyMap[event.key];
+            if (!type) return;
+            event.preventDefault();
+            this.press(type);
+          };
+          this.removeKeyup = (event) => {
+            const type = keyMap[event.key];
+            if (!type) return;
+            event.preventDefault();
+            this.release(type);
+          };
+          document.addEventListener("keydown", this.removeKeydown);
+          document.addEventListener("keyup", this.removeKeyup);
+          window.addEventListener("blur", this.boundBlur);
+        }
+
+        press(type) {
+          this.keys[type] = true;
+          this.follow = true;
+          clearTimeout(this.stopTimer);
+          this.onStatus("驾驶中：相机跟随车辆移动。", false);
+        }
+
+        release(type) {
+          this.keys[type] = false;
+          if (
+            !this.keys.up &&
+            !this.keys.down &&
+            !this.keys.left &&
+            !this.keys.right
+          ) {
+            clearTimeout(this.stopTimer);
+            this.stopTimer = setTimeout(() => {
+              if (Math.abs(this.speed) < 0.15) this.follow = false;
+            }, 700);
+          }
+        }
+
+        releaseAll() {
+          Object.keys(this.keys).forEach((key) => (this.keys[key] = false));
+        }
+
+        update(time) {
+          if (!this.entity) return;
+          if (!this.lastTime) {
+            this.lastTime = Cesium.JulianDate.clone(time);
+            return;
+          }
+          let delta = Cesium.JulianDate.secondsDifference(time, this.lastTime);
+          this.lastTime = Cesium.JulianDate.clone(time);
+          delta = Math.min(Math.max(delta, 0), 0.1);
+
+          const accelerating = this.keys.up || this.keys.down;
+          if (this.keys.up) {
+            this.speed = Math.min(
+              this.maxSpeed,
+              this.speed + this.acceleration * delta,
+            );
+          } else if (this.keys.down) {
+            this.speed = Math.max(
+              -this.maxSpeed * 0.45,
+              this.speed - this.acceleration * delta,
+            );
+          } else if (Math.abs(this.speed) > 0) {
+            const amount = this.brake * delta;
+            this.speed =
+              Math.abs(this.speed) <= amount
+                ? 0
+                : this.speed - Math.sign(this.speed) * amount;
+          }
+
+          if (this.keys.left) {
+            this.heading -= this.turnSpeed * delta * (accelerating ? 1 : 0.35);
+          }
+          if (this.keys.right) {
+            this.heading += this.turnSpeed * delta * (accelerating ? 1 : 0.35);
+          }
+
+          if (Math.abs(this.speed) > 0.001) {
+            const destination = turf.destination(
+              [this.position.longitude, this.position.latitude],
+              this.speed * delta,
+              this.heading,
+              { units: "meters" },
+            );
+            this.position.longitude = destination.geometry.coordinates[0];
+            this.position.latitude = destination.geometry.coordinates[1];
+          }
+
+          this.updateSurfaceHeight();
+          if (this.hasHeightSample) {
+            const maxHeightStep = this.heightSmoothingSpeed * delta;
+            const heightDelta = this.targetHeight - this.position.height;
+            this.position.height += Cesium.Math.clamp(
+              heightDelta,
+              -maxHeightStep,
+              maxHeightStep,
+            );
+          }
+
+          const position = this.getCurrentPosition();
+          this.entity.position = position;
+          this.entity.orientation = this.getOrientation();
+          this.updateSpeed();
+          if (this.follow) this.updateCamera(position);
+        }
+
+        getCurrentPosition() {
+          return Cesium.Cartesian3.fromDegrees(
+            this.position.longitude,
+            this.position.latitude,
+            this.position.height,
+          );
+        }
+
+        getOrientation() {
+          const hpr = new Cesium.HeadingPitchRoll(
+            Cesium.Math.toRadians(this.heading),
+            0,
+            0,
+          );
+          return Cesium.Transforms.headingPitchRollQuaternion(
+            Cesium.Cartesian3.fromDegrees(
+              this.position.longitude,
+              this.position.latitude,
+              this.position.height,
+            ),
+            hpr,
+          );
+        }
+
+        updateSurfaceHeight() {
+          if (
+            !this.surfaceTileset ||
+            performance.now() - this.lastHeightSampleAt <
+              this.heightSampleInterval
+          ) {
+            return;
+          }
+
+          this.lastHeightSampleAt = performance.now();
+          const samplePosition = Cesium.Cartesian3.fromDegrees(
+            this.position.longitude,
+            this.position.latitude,
+            0,
+            Cesium.Ellipsoid.WGS84,
+            this.heightSamplePositionScratch,
+          );
+          if (
+            this.hasHeightSample &&
+            Cesium.Cartesian3.distance(
+              samplePosition,
+              this.lastHeightSamplePosition,
+            ) < this.heightSampleDistance
+          ) {
+            return;
+          }
+
+          const cartographic = Cesium.Cartographic.fromDegrees(
+            this.position.longitude,
+            this.position.latitude,
+            0,
+            this.heightSampleCartographic,
+          );
+          const height = this.surfaceTileset.getHeight(
+            cartographic,
+            this.viewer.scene,
+          );
+          if (!Number.isFinite(height)) return;
+
+          this.targetHeight = height;
+          Cesium.Cartesian3.clone(
+            samplePosition,
+            this.lastHeightSamplePosition,
+          );
+          this.hasHeightSample = true;
+        }
+
+        updateCamera(position) {
+          // lookAt(position, ...) 会始终把车辆作为视线目标，结果就是镜头朝向汽车。
+          // 改为在车辆后方放置镜头，并直接把镜头朝向行驶方向。
+          // 倒车时视线随实际移动方向反转。
+          const travelHeading =
+            this.speed < -0.001 ? this.heading + 180 : this.heading;
+          const cameraDistance = 14;
+          const cameraPoint = turf.destination(
+            [this.position.longitude, this.position.latitude],
+            cameraDistance,
+            travelHeading + 180,
+            { units: "meters" },
+          ).geometry.coordinates;
+
+          this.viewer.camera.setView({
+            destination: Cesium.Cartesian3.fromDegrees(
+              cameraPoint[0],
+              cameraPoint[1],
+              this.position.height + 5,
+            ),
+            orientation: {
+              heading: Cesium.Math.toRadians(travelHeading),
+              pitch: Cesium.Math.toRadians(-10),
+              roll: 0,
+            },
+          });
+        }
+
+        updateSpeed() {
+          if (this.speedElement) {
+            this.speedElement.textContent = Math.abs(this.speed).toFixed(1);
+          }
+        }
+
+        setFollow(value) {
+          this.follow = value;
+          if (!value) {
+            this.viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+          }
+          return this.follow;
+        }
+
+        reset() {
+          this.releaseAll();
+          clearTimeout(this.stopTimer);
+          this.position.longitude = 118.84137541768871;
+          this.position.latitude = 34.04253375933433;
+          this.position.height = 14.45;
+          this.heading = 33;
+          this.speed = 0;
+          this.targetHeight = 14.45;
+          this.hasHeightSample = false;
+          this.lastHeightSampleAt = 0;
+          this.follow = false;
+          this.lastTime = null;
+          if (this.entity) {
+            this.entity.position = Cesium.Cartesian3.fromDegrees(
+              this.position.longitude,
+              this.position.latitude,
+              this.position.height,
+            );
+            this.entity.orientation = this.getOrientation();
+          }
+          this.updateSpeed();
+        }
+
+        destroy() {
+          this.releaseAll();
+          clearTimeout(this.stopTimer);
+          if (this.removeTick) this.removeTick();
+          if (this.removeKeydown)
+            document.removeEventListener("keydown", this.removeKeydown);
+          if (this.removeKeyup)
+            document.removeEventListener("keyup", this.removeKeyup);
+          window.removeEventListener("blur", this.boundBlur);
+        }
+      }
+
+      createApp({
+        data() {
+          return {
+            viewer: null,
+            simulation: null,
+            tileset: null,
+            statusText: "正在初始化场景…",
+            hasError: false,
+            follow: false,
+            controlState: { up: false, down: false, left: false, right: false },
+          };
+        },
+
+        computed: {
+          followText() {
+            return this.follow ? "解除跟随" : "跟随视角";
+          },
+        },
+
+        async mounted() {
+          this.initMap();
+          this.simulation = Vue.markRaw(
+            new DriveSimulation(this.viewer, {
+              speedDom: "speed-value",
+              onStatus: (message, error) => {
+                this.statusText = message;
+                this.hasError = error;
+              },
+            }),
+          );
+          // 车辆和原始项目中的 BIM 道路数据并行加载，Tiles 加载失败不影响驾驶。
+          await Promise.allSettled([
+            // this.addBIM(),
+            this.simulation.startDrive("./data/models/su7.glb", {
+              longitude: 118.84137541768871,
+              latitude: 34.04253375933433,
+              // height: 14.45,
+              height: 0,
+              scale: 1,
+              heading: 33,
+            }),
+          ]);
+        },
+
+        beforeUnmount() {
+          if (this.simulation) this.simulation.destroy();
+          if (this.tileset && !this.tileset.isDestroyed()) {
+            this.viewer.scene.primitives.remove(this.tileset);
+            this.tileset.destroy();
+          }
+          if (this.viewer && !this.viewer.isDestroyed()) this.viewer.destroy();
+        },
+
+        methods: {
+          async addBIM() {
+            try {
+              const tileset = await Cesium.Cesium3DTileset.fromUrl(
+                "./data/bim_road/tileset.json",
+                {
+                  lightColor: new Cesium.Cartesian3(10, 10, 10),
+                  maximumScreenSpaceError: 10,
+                  maximumMemoryUsage: 5120,
+                },
+              );
+              this.tileset = Vue.markRaw(tileset);
+              this.simulation.surfaceTileset = tileset;
+              this.viewer.scene.primitives.add(tileset);
+              this.statusText =
+                "道路 3D Tiles 加载完成，使用方向键或按钮驾驶。";
+            } catch (error) {
+              console.error("道路 3D Tiles 加载失败：", error);
+              this.statusText =
+                "道路 3D Tiles 加载失败，但仍可驾驶；请通过 HTTP 服务访问页面。";
+              this.hasError = true;
+            }
+          },
+
+          initMap() {
+            const viewer = new Cesium.Viewer("cesiumContainer", {
+              baseLayer: false,
+              animation: false,
+              timeline: false,
+              fullscreenButton: false,
+              infoBox: false,
+              geocoder: false,
+              homeButton: false,
+              sceneModePicker: false,
+              baseLayerPicker: false,
+              navigationHelpButton: false,
+              selectionIndicator: false,
+              shouldAnimate: true,
+            });
+
+            viewer.imageryLayers.addImageryProvider(
+              new Cesium.UrlTemplateImageryProvider({
+                url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                maximumLevel: 18,
+              }),
+            );
+            viewer.scene.globe.enableLighting = true;
+            viewer.scene.globe.depthTestAgainstTerrain = true;
+            viewer.scene.fog.enabled = true;
+            viewer.scene.fog.density = 0.00008;
+            viewer.scene.skyAtmosphere.show = true;
+            viewer.scene.postProcessStages.fxaa.enabled = true;
+            viewer.scene.debugShowFramesPerSecond = true;
+            viewer._cesiumWidget._creditContainer.style.display = "none";
+
+            const skyBox = new SkyBox(viewer);
+            skyBox.SkyBoxOnGround({
+              height: 5705,
+              sources: {
+                positiveX: "./data/skyboxImage/px.png",
+                negativeX: "./data/skyboxImage/nx.png",
+                positiveY: "./data/skyboxImage/pz.png",
+                negativeY: "./data/skyboxImage/nz.png",
+                positiveZ: "./data/skyboxImage/py.png",
+                negativeZ: "./data/skyboxImage/ny.png",
+              },
+            });
+            this.viewer = Vue.markRaw(viewer);
+            window.viewer = viewer;
+          },
+
+          pressControl(type, event) {
+            event.preventDefault();
+            event.currentTarget.setPointerCapture?.(event.pointerId);
+            this.controlState[type] = true;
+            if (this.simulation) this.simulation.press(type);
+          },
+
+          releaseControl(type, event) {
+            event.preventDefault();
+            this.controlState[type] = false;
+            if (this.simulation) this.simulation.release(type);
+          },
+
+          toggleFollow() {
+            if (!this.simulation) return;
+            this.follow = this.simulation.setFollow(!this.simulation.follow);
+            this.statusText = this.follow
+              ? "已开启相机跟随。"
+              : "相机已解锁，可自由旋转视角。";
+          },
+
+          resetCamera() {
+            if (!this.viewer || !this.simulation?.entity) return;
+            this.viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+            this.viewer.zoomTo(
+              this.simulation.entity,
+              new Cesium.HeadingPitchRange(
+                Cesium.Math.toRadians(this.simulation.heading + 180),
+                Cesium.Math.toRadians(-16),
+                22,
+              ),
+            );
+            this.follow = false;
+            this.simulation.setFollow(false);
+            this.statusText = "视角已重置。按方向键开始驾驶。";
+          },
+
+          resetCar() {
+            if (!this.simulation) return;
+            this.simulation.reset();
+            this.follow = false;
+            this.resetCamera();
+            this.statusText = "车辆已回到起点。";
+          },
+        },
+      }).mount("#app");
+    </script>
+  </body>
+</html>
