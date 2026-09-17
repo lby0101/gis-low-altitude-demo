@@ -1,0 +1,837 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cesium · 视频投射</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Cesium.js"></script>
+    <link
+      href="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Widgets/widgets.css"
+      rel="stylesheet"
+    />
+    <style>
+      html,
+      body,
+      #app,
+      #cesiumContainer {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #000;
+      }
+
+      .lil-gui {
+        top: 10px;
+        left: 10px;
+        z-index: 999;
+      }
+
+      /* 视频只作为纹理源，不显示在页面上。
+         用「移出屏幕」而不是 display:none —— 部分浏览器会对
+         display:none 的媒体元素暂停/限流解码，导致视频纹理一直是空帧。 */
+      #videoDom {
+        position: fixed;
+        left: -10000px;
+        top: -10000px;
+        width: 2px;
+        height: 2px;
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      #status {
+        position: fixed;
+        left: 10px;
+        bottom: 10px;
+        z-index: 999;
+        max-width: 70vw;
+        padding: 6px 12px;
+        background: rgba(5, 13, 24, 0.85);
+        border: 1px solid #26384c;
+        border-radius: 8px;
+        color: #8da5bd;
+        font:
+          12px system-ui,
+          sans-serif;
+        pointer-events: none;
+      }
+
+      #status b {
+        color: #62dbe9;
+        font-weight: 500;
+      }
+
+      /* 版权容器：JS 里已隐藏，这里兜底 */
+      .cesium-credit-container {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="cesiumContainer"></div>
+      <div id="status">正在初始化…</div>
+      <!-- 视频源：作为材质纹理，必须 muted + playsinline 才能自动播放 -->
+      <video id="videoDom" preload="auto" autoplay loop muted playsinline>
+        <source src="./data/video/video.mp4" type="video/mp4" />
+      </video>
+    </div>
+
+    <script type="module">
+      const { createApp, markRaw } = Vue;
+      import GUI from "https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.esm.js";
+
+      // ============================================================
+      // 视频投射
+      // ============================================================
+      //
+      // 【原理】
+      // 用一个**虚拟相机**充当投影仪：
+      //   1. 把相机放在 viewPosition，朝向 viewPositionEnd，
+      //      用水平/垂直张角算出 fov 与 aspectRatio，
+      //      near/far 取投影距离 ⇒ 得到一个和投影仪视锥一致的相机。
+      //   2. 在**远平面**处放一块极薄的片（near = far - 0.01），
+      //      用 FrustumGeometry 生成，材质贴视频纹理。
+      //      这块片的位置/朝向就是投影仪的"光斑落点"，
+      //      远平面落在哪，视频就投在哪。
+      //   3. 再叠一个 FrustumOutlineGeometry 画视锥线框，
+      //      方便看清投影仪的位置和朝向。
+      //
+      // 【与参考实现（Cesium-Examples 4.3.2）的差异】
+      //   · 参考用 Cesium 1.98 + `requestWebgl1: true`，材质着色器里写
+      //     `texture2D(...)`。本模板用 1.140，默认走 WebGL2（GLSL 300 es），
+      //     而 300 es 里 `texture2D` 已被移除 —— 所以这里改写现代写法
+      //     `texture(...)`。Cesium 在 WebGL1 下会自动把 `texture(` 降级
+      //     成 `texture2D(`（demodernizeShader），因此现代写法两边通吃。
+      //   · 参考用 lodash 的 `_.cloneDeep` 复制 frustum，这里直接构造一个
+      //     `Cesium.PerspectiveFrustum`，省掉 73KB 依赖。
+      //   · 参考的 `clearAll()` 有个笔误（`dd[index]._nam = "video"`
+      //     用了赋值而非比较），这里不复刻。
+      //   · 材质 fabric 补了 `translucent: true`：掩膜羽化处 alpha < 1，
+      //     不声明半透明会进不透明队列，边缘会发黑。
+      // ============================================================
+
+      /**
+       * 由两点求偏航角（度）。
+       * 把目标点换算到起点处的 ENU 坐标系，再用 atan2(x, y) 得到方位。
+       */
+      function getHeading(fromPosition, toPosition) {
+        const finalPosition = new Cesium.Cartesian3();
+        const matrix4 = Cesium.Transforms.eastNorthUpToFixedFrame(fromPosition);
+        Cesium.Matrix4.inverse(matrix4, matrix4);
+        Cesium.Matrix4.multiplyByPoint(matrix4, toPosition, finalPosition);
+        Cesium.Cartesian3.normalize(finalPosition, finalPosition);
+        return Cesium.Math.toDegrees(Math.atan2(finalPosition.x, finalPosition.y));
+      }
+
+      /** 由两点求俯仰角（度）。ENU 下 z 分量即 sin(pitch)。 */
+      function getPitch(fromPosition, toPosition) {
+        const finalPosition = new Cesium.Cartesian3();
+        const matrix4 = Cesium.Transforms.eastNorthUpToFixedFrame(fromPosition);
+        Cesium.Matrix4.inverse(matrix4, matrix4);
+        Cesium.Matrix4.multiplyByPoint(matrix4, toPosition, finalPosition);
+        Cesium.Cartesian3.normalize(finalPosition, finalPosition);
+        return Cesium.Math.toDegrees(Math.asin(finalPosition.z));
+      }
+
+      /** 屏幕坐标 → 地表世界坐标（优先拾取地形，取不到就落到椭球面） */
+      function pickGround(scene, windowPosition, excludeEntity) {
+        const picked = scene.pick(windowPosition);
+        if (scene.pickPositionSupported && Cesium.defined(picked)) {
+          const entity = picked.id;
+          if (!Cesium.defined(excludeEntity) || entity !== excludeEntity) {
+            const cartesian = scene.pickPosition(windowPosition);
+            if (Cesium.defined(cartesian)) {
+              const height = Cesium.Cartographic.fromCartesian(cartesian).height;
+              if (height >= 0) return cartesian;
+              if (!Cesium.defined(picked.id) && height >= -500) return cartesian;
+            }
+          }
+        }
+        if (scene.mode === Cesium.SceneMode.SCENE3D) {
+          return scene.globe.pick(scene.camera.getPickRay(windowPosition), scene);
+        }
+        return scene.camera.pickEllipsoid(windowPosition, scene.globe.ellipsoid);
+      }
+
+      /**
+       * 视频投射材质：把视频当纹理贴到视锥远平面上，
+       * 再用一张羽化掩膜（中心白、边缘渐黑）软化投影的四条边。
+       */
+      function createVideoAppearance(videoElement, maskUrl, useDepthTest) {
+        const source = `
+          czm_material czm_getMaterial(czm_materialInput materialInput) {
+            czm_material material = czm_getDefaultMaterial(materialInput);
+            vec2 st = materialInput.st;
+            vec4 colorImage = texture(image, vec2(st.s, st.t));
+            vec4 maskImage  = texture(tmask, vec2(st.s, st.t));
+            material.alpha   = colorImage.a * color.a * maskImage.r;
+            material.diffuse = colorImage.rgb * color.rgb;
+            return material;
+          }`;
+        const material = new Cesium.Material({
+          // 羽化边缘 alpha < 1，必须声明半透明，否则进不透明队列、边缘发黑
+          translucent: true,
+          fabric: {
+            type: "VideoProjection",
+            // ============================================================
+            // 【为什么这里只能给字符串占位，不能直接给视频元素 / URL】
+            //
+            // Cesium 1.140 的材质系统在**构造时**会对每个 uniform 做类型嗅探
+            // （getUniformType），而它的类型白名单是：
+            //   number / boolean / string / Resource / HTMLCanvasElement /
+            //   HTMLImageElement / ImageBitmap / OffscreenCanvas / 数组 / 普通对象
+            // **没有 HTMLVideoElement**（也没有 Cesium.Texture）。
+            // 所以传视频元素进去，构造阶段就会抛：
+            //   TypeError: Cannot read properties of undefined (reading 'indexOf')
+            //
+            // 字符串会被识别成 sampler2D，因此必须先用字符串占位，
+            // 等构造完成后再替换成真正的值（下面的 material.uniforms.xxx = ...）。
+            //
+            // 参考实现（Cesium-Examples 4.3.2）正是这么做的：fabric 里先塞一段
+            // base64 图片，之后才 `material.uniforms.image = video_dom`。
+            // 那不是随手写的，是绕开类型嗅探的必要写法。
+            //
+            // Material.DefaultImageId 是 Cesium 的特殊占位常量
+            // （值为 "czm_defaultImage"，指向 1×1 默认纹理）。
+            // ============================================================
+            uniforms: {
+              color: new Cesium.Color(1.0, 1.0, 1.0, 1.0),
+              image: Cesium.Material.DefaultImageId,
+              tmask: Cesium.Material.DefaultImageId,
+            },
+            source,
+          },
+        });
+        // 构造完成后再赋真值：运行时的纹理更新函数认 HTMLVideoElement 与
+        // URL/Resource，会自己建纹理、逐帧 copyFrom 视频当前帧
+        material.uniforms.image = videoElement;
+        material.uniforms.tmask = maskUrl;
+        return new Cesium.EllipsoidSurfaceAppearance({
+          material,
+          flat: true,
+          renderState: {
+            cull: { enabled: false },
+            // 参考实现关掉了深度测试：投影片始终可见，不被地形遮挡。
+            // 打开则会被前方地形裁掉，更接近"真实投射"的观感。
+            depthTest: { enabled: !!useDepthTest },
+          },
+        });
+      }
+
+      class VideoProjection {
+        constructor(viewer, options) {
+          this.viewer = viewer;
+          this.options = options || {};
+          this.videoElement = document.getElementById(
+            this.options.videoId || "videoDom",
+          );
+          this.handler = null;
+          this.slabPrimitive = null;
+          this.outlinePrimitive = null;
+          this.lightCamera = null;
+          this.posArray = [];
+
+          // ============================================================
+          // 投射方向与距离：**可直接调**，不必再靠"瞄准点"间接推导
+          // ============================================================
+          //   viewHeading  方位角（度，0=正北，顺时针）
+          //   viewPitch    俯仰角（度，0=水平，-90=垂直向下）
+          //   viewDistance 投射距离（米）＝视锥远平面到投影仪的距离，
+          //                也就是视频最终落在多远的地方
+          //
+          // 【想"正好贴地面"就是这两个值的组合】
+          //   pitch = -90（垂直向下）⇒ 远平面变成水平面，与地面平行
+          //   distance = 投影仪离地高度 ⇒ 远平面正好落在地表
+          //   两者同时满足，视频才是一块平铺在地面上的画面。
+          this.viewHeading = this.options.heading ?? 0;
+          this.viewPitch = this.options.pitch ?? -90;
+          this.viewDistance = this.options.distance ?? 500;
+          this.viewPosition = this.options.viewPosition ?? null;
+          // 方向被交互拾取改写后回调外部（用于回填 GUI 显示）
+          this.onAimChange = null;
+        }
+
+        /** 取当前的方向与距离（供 GUI 回填） */
+        getAim() {
+          return {
+            heading: this.viewHeading,
+            pitch: this.viewPitch,
+            distance: this.viewDistance,
+          };
+        }
+
+        /** 取投影仪的经纬度与高度（供 GUI 回填） */
+        getProjectorLonLatHeight() {
+          if (!this.viewPosition) return {};
+          const c = Cesium.Cartographic.fromCartesian(this.viewPosition);
+          return {
+            lon: Cesium.Math.toDegrees(c.longitude),
+            lat: Cesium.Math.toDegrees(c.latitude),
+            height: c.height,
+          };
+        }
+
+        /**
+         * 统一的"状态已被外部改写"通知。
+         *
+         * 必须把**方向与位置一起**回填 —— 只回方向的话，
+         * 用「拾取位置+瞄准点」点两下换了位置后，GUI 里的
+         * 经度/纬度/高度会停在旧值上，与实际投射对不上。
+         *
+         * 只在「非 GUI 驱动」的入口调用（拾取、贴地），
+         * 避免在用户拖动滑杆时反向刷新控件。
+         */
+        notifyChange() {
+          if (!this.onAimChange) return;
+          this.onAimChange(
+            Object.assign({}, this.getAim(), this.getProjectorLonLatHeight()),
+          );
+        }
+
+        /** 直接设投影仪位置（经纬度 / 高度），保持当前方向与距离 */
+        setProjectorPosition(lon, lat, height) {
+          this.viewPosition = Cesium.Cartesian3.fromDegrees(lon, lat, height);
+          this.createLightCamera();
+        }
+
+        /** 直接设方向与距离 */
+        setAim(heading, pitch, distance) {
+          if (typeof heading === "number") this.viewHeading = heading;
+          if (typeof pitch === "number") this.viewPitch = pitch;
+          if (typeof distance === "number") this.viewDistance = distance;
+          if (this.viewPosition) this.createLightCamera();
+        }
+
+        /**
+         * 贴地：垂直向下 + 距离取"离地高度"。
+         * 无地形时地面即椭球面（高度 0），与影像贴合的面一致。
+         */
+        snapToGround() {
+          if (!this.viewPosition) return;
+          const carto = Cesium.Cartographic.fromCartesian(this.viewPosition);
+          let groundH = 0;
+          const h = this.viewer.scene.globe.getHeight(carto);
+          if (Cesium.defined(h)) groundH = h;
+          this.viewPitch = -90;
+          this.viewDistance = Math.max(1, carto.height - groundH);
+          this.createLightCamera();
+          this.notifyChange();
+        }
+
+        /** 入口：给了起止点就由两点推导，否则用当前方向参数建，或进入拾取模式 */
+        draw() {
+          const o = this.options;
+          this.horizontalViewAngle = o.horizontalViewAngle || 60;
+          this.verticalViewAngle = o.verticalViewAngle || 40;
+          if (o.viewPosition && o.viewPositionEnd) {
+            this.buildFromPositions(o.viewPosition, o.viewPositionEnd);
+          } else if (this.viewPosition) {
+            this.createLightCamera();
+          } else {
+            this.pickByClick();
+          }
+        }
+
+        /** 交互模式：点第一下定投影仪位置，点第二下定瞄准点 */
+        pickByClick() {
+          const self = this;
+          this.clear();
+          this.posArray = [];
+          this.handler = new Cesium.ScreenSpaceEventHandler(
+            this.viewer.scene.canvas,
+          );
+          this.handler.setInputAction(function (movement) {
+            const cartesian = pickGround(self.viewer.scene, movement.position);
+            if (!cartesian) return;
+            if (self.posArray.length === 0) {
+              self.posArray.push(cartesian);
+              self.setStatus("已选投影仪位置，请点击第二点确定瞄准方向…");
+            } else {
+              const from = self.posArray[0];
+              self.handler.destroy();
+              self.handler = null;
+              self.buildFromPositions(from, cartesian);
+            }
+          }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+        }
+
+        /** 由投影仪位置与瞄准点推导 距离/方位/俯仰，然后建相机与几何 */
+        buildFromPositions(viewPosition, viewPositionEnd) {
+          this.viewPosition = viewPosition;
+          this.viewDistance = Cesium.Cartesian3.distance(
+            viewPosition,
+            viewPositionEnd,
+          );
+          this.viewHeading = getHeading(viewPosition, viewPositionEnd);
+          this.viewPitch = getPitch(viewPosition, viewPositionEnd);
+          this.createLightCamera();
+          // 回填方向**和位置**到 GUI：拾取会同时改这两者，
+          // 只回填方向的话经度/纬度/高度会停在旧值
+          this.notifyChange();
+        }
+
+        /** 用投影仪参数构造一台虚拟相机 */
+        createLightCamera() {
+          this.lightCamera = new Cesium.Camera(this.viewer.scene);
+          this.lightCamera.position = this.viewPosition;
+
+          this.lightCamera.frustum.near = this.viewDistance * 0.0001;
+          this.lightCamera.frustum.far = this.viewDistance;
+
+          const hr = Cesium.Math.toRadians(this.horizontalViewAngle);
+          const vr = Cesium.Math.toRadians(this.verticalViewAngle);
+          // 由张角反推宽高比：投影面上横向尺寸 / 纵向尺寸
+          this.lightCamera.frustum.aspectRatio =
+            (this.viewDistance * Math.tan(hr / 2) * 2) /
+            (this.viewDistance * Math.tan(vr / 2) * 2);
+          this.lightCamera.frustum.fov = hr > vr ? hr : vr;
+
+          this.lightCamera.setView({
+            destination: this.viewPosition,
+            orientation: {
+              heading: Cesium.Math.toRadians(this.viewHeading || 0),
+              pitch: Cesium.Math.toRadians(this.viewPitch || 0),
+              roll: 0,
+            },
+          });
+          this.drawFrustum();
+        }
+
+        /** 画投影片（远平面薄片，贴视频）+ 视锥线框 */
+        drawFrustum() {
+          this.clear();
+
+          const cam = this.lightCamera;
+          // 由相机的 right/up/direction 组成旋转矩阵 → 四元数
+          // （right 取负是 FrustumGeometry 的局部轴约定，与参考实现一致）
+          const right = Cesium.Cartesian3.negate(
+            cam.rightWC,
+            new Cesium.Cartesian3(),
+          );
+          const rotation = new Cesium.Matrix3();
+          Cesium.Matrix3.setColumn(rotation, 0, right, rotation);
+          Cesium.Matrix3.setColumn(rotation, 1, cam.upWC, rotation);
+          Cesium.Matrix3.setColumn(rotation, 2, cam.directionWC, rotation);
+          const orientation = Cesium.Quaternion.fromRotationMatrix(rotation);
+
+          // ---- 投影片：远平面处 0.01m 厚的薄片 ----
+          // 必须构造真正的 PerspectiveFrustum：
+          // FrustumGeometry 内部用 `frustum instanceof PerspectiveFrustum` 分派
+          const slabFrustum = new Cesium.PerspectiveFrustum({
+            fov: cam.frustum.fov,
+            aspectRatio: cam.frustum.aspectRatio,
+            near: cam.frustum.far - 0.01,
+            far: cam.frustum.far,
+          });
+
+          const slab = new Cesium.Primitive({
+            geometryInstances: new Cesium.GeometryInstance({
+              geometry: new Cesium.FrustumGeometry({
+                frustum: slabFrustum,
+                origin: this.viewPosition,
+                orientation,
+              }),
+            }),
+            appearance: createVideoAppearance(
+              this.videoElement,
+              this.options.maskUrl,
+              this.options.useDepthTest,
+            ),
+            asynchronous: false,
+          });
+          this.slabPrimitive = this.viewer.scene.primitives.add(slab);
+
+          // ---- 视锥线框 ----
+          if (this.options.showOutline !== false) {
+            const outline = new Cesium.Primitive({
+              geometryInstances: new Cesium.GeometryInstance({
+                geometry: new Cesium.FrustumOutlineGeometry({
+                  frustum: cam.frustum,
+                  origin: this.viewPosition,
+                  orientation,
+                }),
+                attributes: {
+                  color: Cesium.ColorGeometryInstanceAttribute.fromColor(
+                    Cesium.Color.fromCssColorString(
+                      this.options.outlineColor || "#36e4ff",
+                    ),
+                  ),
+                },
+              }),
+              appearance: new Cesium.PerInstanceColorAppearance({ flat: true }),
+              asynchronous: false,
+            });
+            this.outlinePrimitive = this.viewer.scene.primitives.add(outline);
+          }
+
+          this.reportStatus();
+        }
+
+        /** 清掉已画的图元（改参数前必须先清，否则会叠一堆） */
+        clear() {
+          const scene = this.viewer.scene;
+          for (const key of ["slabPrimitive", "outlinePrimitive"]) {
+            const p = this[key];
+            if (p) {
+              scene.primitives.remove(p);
+              if (!p.isDestroyed()) p.destroy();
+              this[key] = null;
+            }
+          }
+        }
+
+        /** 改参数：重算相机并重绘 */
+        set(key, value) {
+          if (key === "horizontalViewAngle" || key === "verticalViewAngle") {
+            this[key] = value;
+          } else {
+            this.options[key] = value;
+          }
+          if (!this.viewPosition) return;
+          this.createLightCamera();
+        }
+
+        /** 切换为交互拾取模式 */
+        restartPicking() {
+          if (this.handler) {
+            this.handler.destroy();
+            this.handler = null;
+          }
+          this.pickByClick();
+        }
+
+        setStatus(text) {
+          const el = document.getElementById("status");
+          if (el) el.textContent = text;
+        }
+
+        reportStatus() {
+          const v = this.videoElement;
+          const d = this.viewDistance;
+          this.setStatus(
+            `投影仪 ${d ? d.toFixed(0) : "?"} m · 水平 ${
+              this.horizontalViewAngle
+            }° · 垂直 ${this.verticalViewAngle}° · 视频 ${
+              v && v.readyState >= 2 ? "已就绪" : "加载中"
+            }（${v && v.videoWidth ? v.videoWidth + "×" + v.videoHeight : "—"}）`,
+          );
+        }
+
+        destroy() {
+          if (this.handler) {
+            this.handler.destroy();
+            this.handler = null;
+          }
+          this.clear();
+        }
+      }
+
+      // ============================================================
+      // Vue 应用
+      // ============================================================
+
+      // 默认：投影仪在 900m 高、垂直向下、投射距离 900m
+      // ⇒ pitch=-90 + distance=离地高度 = 视频正好平铺在地面上
+      const DEFAULT_LON = 119.148422;
+      const DEFAULT_LAT = 31.949419;
+      const DEFAULT_HEIGHT = 50;
+      const DEFAULT_POS = Cesium.Cartesian3.fromDegrees(
+        DEFAULT_LON,
+        DEFAULT_LAT,
+        DEFAULT_HEIGHT,
+      );
+
+      createApp({
+        data() {
+          return {
+            viewer: null,
+            imageryLayer: null,
+            projection: null,
+            myLilGui: null,
+            params: {
+              // —— 投射方向与距离（可调）——
+              heading: 0, // 方位角：0=正北，顺时针
+              pitch: -90, // 俯仰角：-90=垂直向下（贴地）
+              distance: DEFAULT_HEIGHT, // 投射距离(m)
+              // —— 投影仪位置 ——
+              lon: DEFAULT_LON,
+              lat: DEFAULT_LAT,
+              height: DEFAULT_HEIGHT,
+              // —— 视锥张角与显示 ——
+              horizontalViewAngle: 60,
+              verticalViewAngle: 40,
+              showOutline: true,
+              useDepthTest: false,
+              playing: true,
+            },
+          };
+        },
+        async mounted() {
+          this.initMap();
+          this.addlilgui();
+          this.startProjection();
+        },
+        beforeUnmount() {
+          if (this.projection) this.projection.destroy();
+          if (this.myLilGui) {
+            this.myLilGui.destroy();
+            this.myLilGui = null;
+          }
+        },
+        methods: {
+          initMap() {
+            const viewer = new Cesium.Viewer("cesiumContainer", {
+              baseLayer: false,
+              animation: false,
+              timeline: false,
+              fullscreenButton: false,
+              infoBox: false,
+              geocoder: false,
+              homeButton: false,
+              sceneModePicker: false,
+              baseLayerPicker: false,
+              navigationHelpButton: false,
+              selectionIndicator: false,
+              shouldAnimate: true,
+            });
+
+            window.viewer = viewer;
+            viewer.scene.debugShowFramesPerSecond = true;
+            viewer.scene.globe.enableLighting = false;
+            viewer.scene.fog.enabled = true;
+            viewer.scene.fog.density = 0.00008;
+            viewer.scene.skyAtmosphere.show = true;
+            // 参考实现开了它：地形会遮挡其后方的物体，
+            // 投影片是否被地形裁掉由材质的 depthTest 决定
+            viewer.scene.globe.depthTestAgainstTerrain = true;
+            viewer._cesiumWidget._creditContainer.style.display = "none";
+
+            const imageryLayer = viewer.imageryLayers.addImageryProvider(
+              new Cesium.UrlTemplateImageryProvider({
+                url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                maximumLevel: 18,
+              }),
+            );
+
+            this.viewer = markRaw(viewer);
+            this.imageryLayer = markRaw(imageryLayer);
+            this.resetCamera();
+            return viewer;
+          },
+
+          /**
+           * 建立投射。
+           *
+           * 【不要等 loadeddata 再建】
+           * 材质里 Cesium 自己会检查 `video.readyState >= 2`：
+           * 未就绪时这一帧不更新纹理，就绪后自动生效。
+           * 若在这里等事件，视频慢或事件被吞掉时投射会永远不出现。
+           */
+          startProjection() {
+            const video = document.getElementById("videoDom");
+            const self = this;
+
+            video.addEventListener("error", () => {
+              const e = video.error;
+              self.setStatus(
+                "视频加载失败：" +
+                  (e ? `code ${e.code} ${e.message || ""}` : "未知错误"),
+              );
+            });
+            video.addEventListener("loadeddata", () => {
+              if (self.projection) self.projection.reportStatus();
+            });
+
+            video.play().catch(() => {
+              self.setStatus("视频自动播放被拦截，请点击页面任意处后重试");
+            });
+
+            // 8 秒后视频仍未就绪就给个提示：材质此时用的是默认白纹理，
+            // 画面上会是一块白板，不说清楚很容易误判成"功能没实现"
+            this._videoHintTimer = setTimeout(() => {
+              if (video.readyState < 2) {
+                self.setStatus(
+                  `视频尚未就绪（readyState=${video.readyState} ` +
+                    `networkState=${video.networkState}）——` +
+                    `投影片会显示为白板。请检查 ./data/video/video.mp4 是否可访问。`,
+                );
+              }
+            }, 8000);
+
+            this.projection = markRaw(
+              new VideoProjection(this.viewer, {
+                videoId: "videoDom",
+                maskUrl: "./data/video/mask.jpg",
+                horizontalViewAngle: this.params.horizontalViewAngle,
+                verticalViewAngle: this.params.verticalViewAngle,
+                showOutline: this.params.showOutline,
+                useDepthTest: this.params.useDepthTest,
+                viewPosition: DEFAULT_POS,
+                heading: this.params.heading,
+                pitch: this.params.pitch,
+                distance: this.params.distance,
+              }),
+            );
+            // 交互拾取会改写方向：把推导结果回填到 GUI 滑杆
+            // 拾取位置 / 贴地会同时改写「方向」和「投影仪位置」，
+            // 这里全部回填到 GUI 滑杆（否则滑杆停在旧值，与实际投射对不上）
+            this.projection.onAimChange = (state) => {
+              const s = Object.assign({}, state);
+              // 做点取整，免得滑杆上是一长串浮点数
+              if (typeof s.lon === "number") s.lon = +s.lon.toFixed(6);
+              if (typeof s.lat === "number") s.lat = +s.lat.toFixed(6);
+              if (typeof s.height === "number") s.height = +s.height.toFixed(1);
+              if (typeof s.distance === "number")
+                s.distance = +s.distance.toFixed(1);
+              if (typeof s.heading === "number") s.heading = +s.heading.toFixed(1);
+              if (typeof s.pitch === "number") s.pitch = +s.pitch.toFixed(2);
+              Object.assign(this.params, s);
+              this.refreshGui();
+            };
+            this.projection.draw();
+          },
+
+          /** 让 lil-gui 的控件重新读取 params（否则滑杆停在旧值） */
+          refreshGui() {
+            if (!this.myLilGui) return;
+            this.myLilGui.controllersRecursive().forEach((c) => c.updateDisplay());
+          },
+
+          addlilgui() {
+            const gui = new GUI();
+            this.myLilGui = gui;
+            const p = this.params;
+            const proj = () => this.projection;
+
+            // ============================================================
+            // 投射方向与距离
+            // ============================================================
+            const aim = gui.addFolder("投射方向");
+            aim
+              .add(p, "heading", 0, 360, 1)
+              .name("方位角(°) 0=正北")
+              .onChange((v) =>
+                proj() && proj().setAim(v, undefined, undefined),
+              );
+            aim
+              .add(p, "pitch", -90, 0, 0.5)
+              .name("俯仰角(°) -90=垂直向下")
+              .onChange((v) =>
+                proj() && proj().setAim(undefined, v, undefined),
+              );
+            aim
+              .add(p, "distance", 20, 20000, 10)
+              .name("投射距离(m)")
+              .onChange((v) =>
+                proj() && proj().setAim(undefined, undefined, v),
+              );
+            aim
+              .add(
+                {
+                  snap: () => {
+                    if (!proj()) return;
+                    proj().snapToGround();
+                    this.setStatus("已贴地：俯仰 -90°，距离 = 投影仪离地高度");
+                  },
+                },
+                "snap",
+              )
+              .name("★ 贴地（垂直向下）");
+
+            // ============================================================
+            // 投影仪位置
+            // ============================================================
+            const pos = gui.addFolder("投影仪位置");
+            const applyPos = () => {
+              if (proj()) proj().setProjectorPosition(p.lon, p.lat, p.height);
+            };
+            pos.add(p, "lon", 70, 140, 0.000001).name("经度").onChange(applyPos);
+            pos.add(p, "lat", 3, 55, 0.000001).name("纬度").onChange(applyPos);
+            pos
+              .add(p, "height", 10, 20000, 10)
+              .name("高度(m)")
+              .onChange(applyPos);
+
+            // ============================================================
+            // 视锥张角与显示
+            // ============================================================
+            gui
+              .add(p, "horizontalViewAngle", 10, 120, 1)
+              .name("水平张角(°)")
+              .onChange((v) => proj() && proj().set("horizontalViewAngle", v));
+            gui
+              .add(p, "verticalViewAngle", 10, 120, 1)
+              .name("垂直张角(°)")
+              .onChange((v) => proj() && proj().set("verticalViewAngle", v));
+            gui
+              .add(p, "showOutline")
+              .name("显示视锥线框")
+              .onChange((v) => proj() && proj().set("showOutline", v));
+            gui
+              .add(p, "useDepthTest")
+              .name("地形遮挡投影")
+              .onChange((v) => proj() && proj().set("useDepthTest", v));
+            gui
+              .add(p, "playing")
+              .name("播放 / 暂停")
+              .onChange((v) => {
+                const el = document.getElementById("videoDom");
+                if (!el) return;
+                if (v) el.play().catch(() => {});
+                else el.pause();
+              });
+            gui
+              .add(
+                {
+                  repick: () =>
+                    this.projection && this.projection.restartPicking(),
+                },
+                "repick",
+              )
+              .name("拾取位置+瞄准点（点两下）");
+            gui.add(this, "resetCamera").name("重置视角");
+
+            gui
+              .addFolder("场景")
+              .add(this.imageryLayer, "show")
+              .name("影像底图");
+          },
+
+          resetCamera() {
+            if (!this.viewer) return;
+            const p = this.params;
+            // 站在投影仪南侧、斜俯视：既能看到空中的视锥，也能看到地面光斑。
+            // 相机纬度按「高度 / tan(俯角)」反推，保证视线中心正好落在光斑上。
+            const camHeight = 2400;
+            const camPitchDeg = -35;
+            const groundDist =
+              camHeight / Math.tan(Cesium.Math.toRadians(-camPitchDeg));
+            const dLat = groundDist / 111320;
+            this.viewer.camera.setView({
+              destination: Cesium.Cartesian3.fromDegrees(
+                p.lon,
+                p.lat - dLat,
+                camHeight,
+              ),
+              orientation: {
+                heading: Cesium.Math.toRadians(0),
+                pitch: Cesium.Math.toRadians(camPitchDeg),
+                roll: Cesium.Math.toRadians(0),
+              },
+            });
+          },
+
+          setStatus(text) {
+            const el = document.getElementById("status");
+            if (el) el.textContent = text;
+          },
+        },
+      }).mount("#app");
+    </script>
+  </body>
+</html>
