@@ -1,25 +1,3 @@
-// 绘制管理器：多边形 / 折线 / 矩形 / 圆 的绘制、预览、贴地形显示与样式控制
-// 依赖全局 Cesium
-//
-// 构造参数：
-//   viewer        Cesium.Viewer 实例
-//   onStatus      状态文本回调：onStatus(text)
-//   onDrawComplete 绘制完成回调：onDrawComplete(info)，info 包含
-//                  id / type / positions(Cartesian3[]) / lonLats(度) 及测量信息
-//
-// 实例属性：
-//   lastShape     最近一次绘制完成的图形数据（同 info 结构），供"下一步"按需读取；
-//                 无图形时 null，clearAll 后重置为 null
-//
-// 对外统一接口：
-//   startDraw(type)  // type: 'polygon' | 'polyline' | 'rectangle' | 'circle'
-//   finishDraw()     // 完成当前绘制（多边形/折线右键结束；矩形/圆第二次左键确认）
-//   cancelDraw()     // 取消当前绘制
-//   clearAll()       // 清除所有图形与绘制状态
-//   applyStyle()     // 把 params 样式应用到所有已绘图形
-//   flyTo()          // 视角飞到已绘图形
-//   destroy()        // 销毁，清理全部资源
-
 // ---------- 测量工具（局部平面近似，仅用于面板展示） ----------
 
 function metersPerDegree(latDeg) {
@@ -78,14 +56,81 @@ function measureRectangle(rectangle) {
   return { area: width * height, perimeter: 2 * (width + height) };
 }
 
-const SHAPE_TYPES = ["polygon", "polyline", "rectangle", "circle"];
+const SHAPE_TYPES = [
+  "polygon",
+  "polyline",
+  "rectangle",
+  "circle",
+  "height",
+  "azimuth",
+];
+
+// 这两类只取两个点：第二点落下即自动完成，不需要右键
+const TWO_POINT_TYPES = ["height", "azimuth"];
+
+// 绘制完成后不保留"最后一个取点"标记的类型。
+// 方位角的终点就是箭头尖端，本身已经指明了位置，再叠一个圆点纯属干扰。
+const HIDE_LAST_VERTEX_TYPES = ["azimuth"];
 
 const START_HINTS = {
   polygon: "左键逐点取点（≥3 个），右键结束绘制。",
   polyline: "左键逐点取点（≥2 个），右键结束绘制。",
   rectangle: "左键点击第一个角点。",
   circle: "左键点击圆心。",
+  height: "左键点击起点，再点第二个点 —— 两点落下自动生成高距三角形。",
+  azimuth: "左键点击起点，再点第二个点 —— 两点落下自动生成方位角。",
 };
+
+// ---------- 测量开关 ----------
+
+/**
+ * 测量标注的默认开关：**默认只绘制，不测量**。
+ * 由 startDraw(type, options) 覆盖。
+ *
+ *   measure       总开关。false 时完全不出标注
+ *   showArea      面积类标注（仅 polygon / rectangle / circle 有）
+ *   showPerimeter 周长 / 长度 / 距离 / 角度类标注
+ *
+ * 【各类型支持哪些测量项】
+ *   polygon / rectangle  面积(showArea) + 周长(showPerimeter)
+ *   circle               面积(showArea) + 周长(showPerimeter)
+ *   polyline             长度(showPerimeter) —— 没有面积项
+ *   height               垂直距离 + 水平距离(showPerimeter)
+ *   azimuth              方位角(showPerimeter)
+ */
+const MEASURE_DEFAULTS = {
+  measure: false,
+  showArea: true,
+  showPerimeter: true,
+};
+
+/** 面积文本：按量级自动切换 ㎡ / 公顷 / km² */
+function formatAreaText(m2) {
+  if (!isFinite(m2) || m2 <= 0) return "—";
+  if (m2 >= 1e6) return `${(m2 / 1e6).toFixed(3)} km²`;
+  if (m2 >= 1e4) return `${(m2 / 1e4).toFixed(2)} 公顷`;
+  return `${m2.toFixed(1)} ㎡`;
+}
+
+/** 长度文本：按量级自动切换 m / km */
+function formatLengthText(m) {
+  if (!isFinite(m) || m <= 0) return "—";
+  return m >= 1000 ? `${(m / 1000).toFixed(3)} km` : `${m.toFixed(1)} m`;
+}
+
+/**
+ * 由两点求方位角（度）。
+ * 把目标点换算到起点处的 ENU 坐标系（x=东, y=北, z=天），
+ * 再 atan2(东, 北) ⇒ 0° 为正北，顺时针增大，范围 [0, 360)。
+ */
+function bearingDegrees(fromPosition, toPosition) {
+  const enu = Cesium.Transforms.eastNorthUpToFixedFrame(fromPosition);
+  const inv = Cesium.Matrix4.inverse(enu, new Cesium.Matrix4());
+  const local = Cesium.Matrix4.multiplyByPoint(inv, toPosition, new Cesium.Cartesian3());
+  Cesium.Cartesian3.normalize(local, local);
+  const deg = Cesium.Math.toDegrees(Math.atan2(local.x, local.y));
+  return (deg + 360) % 360;
+}
 
 export default class DrawManager {
   constructor({ viewer, onStatus, onDrawComplete }) {
@@ -113,6 +158,8 @@ export default class DrawManager {
       polyline: [],
       rectangle: [],
       circle: [],
+      height: [],
+      azimuth: [],
     };
 
     // 样式参数（交给 lil-gui 直接绑定）
@@ -124,23 +171,49 @@ export default class DrawManager {
       showVertices: true,
       vertexSize: 8,
     };
+
+    // 测量开关：由 startDraw(type, options) 覆盖，默认只绘制不测量
+    this.measureOptions = { ...MEASURE_DEFAULTS };
+    // 测量标注实体。这些 Label 是自己加到 viewer.entities 上的，
+    // Cesium 不会替我们回收，所以换图 / 清除 / 销毁时都要显式摘掉。
+    this.measureLabelEntities = [];
   }
 
   // ============================================================
   // 对外统一接口
   // ============================================================
 
-  startDraw(type) {
+  /**
+   * 开始绘制。
+   *
+   * @param {string} type  polygon | polyline | rectangle | circle | height | azimuth
+   * @param {object} [options] 测量开关，不传则沿用 MEASURE_DEFAULTS（只绘制不测量）
+   *        · measure       总开关。true 才出测量标注
+   *        · showArea      面积标注（仅 polygon / rectangle / circle 有面积项）
+   *        · showPerimeter 周长 / 长度 / 距离 / 角度标注
+   */
+  startDraw(type, options) {
     if (!SHAPE_TYPES.includes(type)) {
       this.onStatus(`不支持的绘制类型：${type}`);
       return;
     }
-    this.clearAll();
+    this.clearAll(); // 内部会摘掉上一轮的测量标注
+    // 注意顺序：clearAll 之后再设本次开关，否则会被重置掉
+    this.measureOptions = { ...MEASURE_DEFAULTS, ...(options || {}) };
     this.mode = type;
     this.drawing = true;
     this._createPreview();
     this.onStatus(START_HINTS[type]);
     this._bindDrawEvents();
+  }
+
+  /**
+   * 运行时改测量开关（对应面板上的复选框）。
+   * 已画好的图形会立即按新开关重绘标注，不需要重新绘制。
+   */
+  setMeasureOptions(options) {
+    Object.assign(this.measureOptions, options || {});
+    this._createMeasureLabels(this.lastShape);
   }
 
   finishDraw() {
@@ -149,10 +222,13 @@ export default class DrawManager {
 
     this._destroyHandler();
     this._removePreview(true); // 保留顶点标记，只移除动态预览
+    this._trimVertexMarkers(mode); // 部分类型不要终点标记（如方位角的箭头尖端）
     this._createFinalShape(mode);
     this.onStatus(this._measureText(mode));
     const info = this._buildCompletePayload(mode);
     this.lastShape = info;
+    // 按 measureOptions 出测量标注（measure 为 false 时这里什么都不做）
+    this._createMeasureLabels(info);
     this.onDrawComplete(info);
     this._resetDrawState();
   }
@@ -160,6 +236,7 @@ export default class DrawManager {
   cancelDraw() {
     this._destroyHandler();
     this._removePreview();
+    this._removeMeasureLabels();
     this._resetDrawState();
   }
 
@@ -171,6 +248,7 @@ export default class DrawManager {
       );
       this.shapeEntities[key] = [];
     }
+    this._removeMeasureLabels();
     this.lastShape = null;
     this.onStatus("已清除。");
   }
@@ -180,6 +258,9 @@ export default class DrawManager {
     const outline = this._outlineMaterial();
 
     for (const key of Object.keys(this.shapeEntities)) {
+      // height / azimuth 的线有自己的材质（箭头、虚线）和配色，
+      // 不能被统一的 outlineColor / outlineWidth 覆盖，否则语义就丢了。
+      if (key === "height" || key === "azimuth") continue;
       for (const entity of this.shapeEntities[key]) {
         if (entity.polygon) entity.polygon.material = fill;
         if (entity.rectangle) entity.rectangle.material = fill;
@@ -247,6 +328,18 @@ export default class DrawManager {
   _handleLeftClick(click) {
     const cartesian = this._pickGlobe(click.position);
     if (!cartesian) return;
+
+    // 两点类：取满两点立即完成，不走右键
+    if (TWO_POINT_TYPES.includes(this.mode)) {
+      this._addPoint(cartesian, true);
+      if (this.drawPositions.length === 1) {
+        this.onStatus("已选起点，请点击第二个点。");
+      } else {
+        this.finishDraw();
+      }
+      return;
+    }
+
     if (this.mode === "polygon" || this.mode === "polyline") {
       this._addPoint(cartesian);
     } else {
@@ -258,7 +351,11 @@ export default class DrawManager {
     const cartesian = this._pickGlobe(movement.endPosition);
     if (!cartesian) return;
 
-    if (this.mode === "polygon" || this.mode === "polyline") {
+    if (
+      this.mode === "polygon" ||
+      this.mode === "polyline" ||
+      TWO_POINT_TYPES.includes(this.mode)
+    ) {
       this.movingPosition = cartesian;
     } else if (this.mode === "rectangle" && this.anchorCartesian) {
       this.previewRectangle = this._rectangleFromTwoCartesians(
@@ -307,7 +404,7 @@ export default class DrawManager {
     this.finishDraw();
   }
 
-  _addPoint(cartesian) {
+  _addPoint(cartesian, quiet = false) {
     this.drawPositions.push(cartesian);
     this.drawPointEntities.push(
       this.viewer.entities.add({
@@ -321,7 +418,10 @@ export default class DrawManager {
         },
       }),
     );
-    this.onStatus(`已取 ${this.drawPositions.length} 个点，右键结束绘制。`);
+    // quiet：由调用方负责状态文案（两点类没有"右键结束"这一步）
+    if (!quiet) {
+      this.onStatus(`已取 ${this.drawPositions.length} 个点，右键结束绘制。`);
+    }
   }
 
   _canFinish(mode) {
@@ -329,6 +429,7 @@ export default class DrawManager {
     if (mode === "polyline") return this.drawPositions.length >= 2;
     if (mode === "rectangle") return !!this.previewRectangle;
     if (mode === "circle") return !!this.previewRadius;
+    if (TWO_POINT_TYPES.includes(mode)) return this.drawPositions.length >= 2;
     return false;
   }
 
@@ -520,6 +621,25 @@ export default class DrawManager {
           },
         }),
       );
+    } else if (TWO_POINT_TYPES.includes(mode)) {
+      // 两点类预览：起点 → 鼠标的直线。
+      // 贴不贴地要跟最终图形保持一致，否则松手瞬间会"跳"一下：
+      //   · 测高距 → 不贴地（最终是三维直线，斜边必须保持直线）
+      //   · 方位角 → 贴地（最终箭头线跟着地形起伏）
+      this.previewEntities.push(
+        this.viewer.entities.add({
+          polyline: {
+            positions: new Cesium.CallbackProperty(() => {
+              const p = this.drawPositions.slice();
+              if (this.drawing && this.movingPosition) p.push(this.movingPosition);
+              return p.length > 1 ? p : [];
+            }, false),
+            width: 2,
+            clampToGround: mode === "azimuth",
+            material: Cesium.Color.CYAN,
+          },
+        }),
+      );
     }
   }
 
@@ -534,6 +654,17 @@ export default class DrawManager {
       );
       this.drawPointEntities = [];
     }
+  }
+
+  /**
+   * 按类型摘掉不需要的顶点标记。
+   * 目前只有方位角：终点即箭头尖端，留着圆点会跟箭头、方位角标注挤在一起。
+   * 起点标记保留 —— 它是箭头和正北虚线的共同原点，有参照价值。
+   */
+  _trimVertexMarkers(mode) {
+    if (!HIDE_LAST_VERTEX_TYPES.includes(mode)) return;
+    const last = this.drawPointEntities.pop();
+    if (last) this.viewer.entities.remove(last);
   }
 
   // ============================================================
@@ -585,16 +716,15 @@ export default class DrawManager {
           },
         }),
       );
-      const ring = [
-        rect.west,
-        rect.south,
-        rect.west,
-        rect.north,
-        rect.east,
-        rect.north,
-        rect.east,
-        rect.south,
-      ];
+      // 描边：注意 Cesium.Rectangle 的 west/south/east/north 是**弧度**，
+      // 而 Cartesian3.fromDegreesArray() 要的是**度** —— 必须显式转换，
+      // 否则边框会被画到完全错误的位置（约 2°E / 0.5°N 一带），看上去"没有边框"。
+      // 同时数组末尾要回到起点，把环闭合，不然会缺一条边。
+      const w = Cesium.Math.toDegrees(rect.west);
+      const s = Cesium.Math.toDegrees(rect.south);
+      const e = Cesium.Math.toDegrees(rect.east);
+      const n = Cesium.Math.toDegrees(rect.north);
+      const ring = [w, s, w, n, e, n, e, s, w, s];
       this.shapeEntities.rectangle.push(
         this.viewer.entities.add({
           polyline: {
@@ -628,7 +758,176 @@ export default class DrawManager {
           },
         }),
       );
+    } else if (mode === "height") {
+      // 高距：三条线构成直角三角形
+      //   直连线段（斜边，不贴地） + 垂直连线 + 水平连线
+      const g = this._heightGeometry();
+      if (!g) return;
+      const w = Math.max(2, this.params.outlineWidth);
+
+      // ① 直连线段：两点直接相连，clampToGround: false 保持三维直线
+      this.shapeEntities.height.push(
+        this.viewer.entities.add({
+          polyline: {
+            positions: [g.a, g.b],
+            clampToGround: false,
+            width: w,
+            material: Cesium.Color.fromCssColorString("#ffd166"),
+          },
+        }),
+      );
+      // ② 垂直连线：低点 → 低点正上方的最高点高度
+      this.shapeEntities.height.push(
+        this.viewer.entities.add({
+          polyline: {
+            positions: [g.low, g.up],
+            clampToGround: false,
+            width: w,
+            material: Cesium.Color.fromCssColorString("#ff5d7a"),
+          },
+        }),
+      );
+      // ③ 水平连线：在最高处的高度上，从垂线顶端连到高点
+      this.shapeEntities.height.push(
+        this.viewer.entities.add({
+          polyline: {
+            positions: [g.up, g.high],
+            clampToGround: false,
+            width: w,
+            material: Cesium.Color.fromCssColorString("#35e0f0"),
+          },
+        }),
+      );
+    } else if (mode === "azimuth") {
+      // 方位角：箭头线（起点→终点） + 正北参考虚线
+      const g = this._azimuthGeometry();
+      if (!g) return;
+
+      this.shapeEntities.azimuth.push(
+        this.viewer.entities.add({
+          polyline: {
+            positions: [g.a, g.b],
+            // 箭头线贴地：跟着地形起伏走。
+            // Cesium 的 GroundPolylinePrimitive 支持 PolylineArrowMaterialProperty，
+            // 所以贴地和箭头样式可以同时要。
+            clampToGround: true,
+            width: Math.max(3, this.params.outlineWidth),
+            material: new Cesium.PolylineArrowMaterialProperty(
+              Cesium.Color.fromCssColorString("#ffd166"),
+            ),
+          },
+        }),
+      );
+      this.shapeEntities.azimuth.push(
+        this.viewer.entities.add({
+          polyline: {
+            positions: [g.a, g.north],
+            clampToGround: false,
+            width: 2,
+            material: new Cesium.PolylineDashMaterialProperty({
+              color: Cesium.Color.fromCssColorString("#9fb6cc"),
+              dashLength: 16,
+            }),
+          },
+        }),
+      );
     }
+  }
+
+  // ============================================================
+  // 内部：高距 / 方位角的几何
+  // ============================================================
+
+  /**
+   * 高距三角形。约定：
+   *   · 垂线立在**较低**那个点的水平位置上，向上到较高点的高程
+   *   · 水平线取**最高处的高**，从垂线顶端连到较高点
+   *   · 直连线就是两点的三维直线（斜边）
+   * 直角顶点 = 低点水平位置 + 高点高程。
+   */
+  _heightGeometry() {
+    if (this.drawPositions.length < 2) return null;
+    const a = this.drawPositions[0];
+    const b = this.drawPositions[1];
+    const ca = Cesium.Cartographic.fromCartesian(a);
+    const cb = Cesium.Cartographic.fromCartesian(b);
+    const ha = ca.height;
+    const hb = cb.height;
+
+    const lowIsA = ha <= hb;
+    const lowCarto = lowIsA ? ca : cb;
+    const hLow = lowIsA ? ha : hb;
+    const hHigh = lowIsA ? hb : ha;
+    const high = lowIsA ? b : a;
+
+    const low = Cesium.Cartesian3.fromRadians(
+      lowCarto.longitude,
+      lowCarto.latitude,
+      hLow,
+    );
+    const up = Cesium.Cartesian3.fromRadians(
+      lowCarto.longitude,
+      lowCarto.latitude,
+      hHigh,
+    );
+    const highCarto = Cesium.Cartographic.fromCartesian(high);
+
+    // 标注锚点用**精确中点**，而不是 Cartesian3.midpoint：
+    // 后者取 ECEF 弦中点，同一高度、不同经纬度的两点之间会略低于真实高度。
+    // 垂直距离 → 垂线中点（低点水平位置，高程取两者平均）
+    // 水平距离 → 水平线中点（经纬度平均，高程取最高处）
+    const verticalMid = Cesium.Cartesian3.fromRadians(
+      lowCarto.longitude,
+      lowCarto.latitude,
+      (hLow + hHigh) / 2,
+    );
+    const horizontalMid = Cesium.Cartesian3.fromRadians(
+      (lowCarto.longitude + highCarto.longitude) / 2,
+      (lowCarto.latitude + highCarto.latitude) / 2,
+      hHigh,
+    );
+
+    return {
+      a,
+      b,
+      low,
+      up,
+      high,
+      heights: [ha, hb],
+      vertical: hHigh - hLow,
+      horizontal: this._distanceOnGround(a, b),
+      slope: Cesium.Cartesian3.distance(a, b),
+      verticalMid,
+      horizontalMid,
+    };
+  }
+
+  /**
+   * 方位角。正北参考线沿**同一条经线**向北，长度取两点的水平距离，
+   * 这样图上那个夹角就是真实的方位角。
+   */
+  _azimuthGeometry() {
+    if (this.drawPositions.length < 2) return null;
+    const a = this.drawPositions[0];
+    const b = this.drawPositions[1];
+    const ca = Cesium.Cartographic.fromCartesian(a);
+    const horizontal = this._distanceOnGround(a, b);
+    // 注意：111320 是"每度纬度的米数"，得到的是**度**，
+    // 而 Cartographic.latitude 是**弧度** —— 必须转一道再用。
+    const dLat = Cesium.Math.toRadians(horizontal / 111320);
+    const north = Cesium.Cartesian3.fromRadians(
+      ca.longitude,
+      ca.latitude + dLat,
+      ca.height,
+    );
+
+    return {
+      a,
+      b,
+      north,
+      azimuth: bearingDegrees(a, b),
+      horizontal,
+    };
   }
 
   // ============================================================
@@ -691,6 +990,27 @@ export default class DrawManager {
       info.lonLats = toLonLats(info.positions).map((p) => [p.x, p.y]);
       info.area = Math.PI * info.radius * info.radius;
       info.perimeter = 2 * Math.PI * info.radius;
+    } else if (mode === "height") {
+      const g = this._heightGeometry();
+      if (!g) return info;
+      info.positions = [g.a, g.b];
+      info.lonLats = toLonLats([g.a, g.b]).map((p) => [p.x, p.y]);
+      info.heights = g.heights;
+      info.verticalDistance = g.vertical;
+      info.horizontalDistance = g.horizontal;
+      info.slopeDistance = g.slope;
+      // 标注锚点：垂线中点 / 水平线中点
+      info.verticalLabelPos = g.verticalMid;
+      info.horizontalLabelPos = g.horizontalMid;
+    } else if (mode === "azimuth") {
+      const g = this._azimuthGeometry();
+      if (!g) return info;
+      info.positions = [g.a, g.b];
+      info.lonLats = toLonLats([g.a, g.b]).map((p) => [p.x, p.y]);
+      info.azimuth = g.azimuth;
+      info.distance = g.horizontal;
+      // 标注锚点：终点
+      info.azimuthLabelPos = g.b;
     }
 
     return info;
@@ -735,6 +1055,223 @@ export default class DrawManager {
         `周长：${perimeter.toFixed(0)} m`,
       ].join("\n");
     }
+    if (mode === "height") {
+      const g = this._heightGeometry();
+      if (!g) return "";
+      return [
+        "高距测量完成。",
+        `垂直距离：${g.vertical.toFixed(2)} m`,
+        `水平距离：${g.horizontal.toFixed(2)} m`,
+        `斜距：${g.slope.toFixed(2)} m`,
+        `起点高程：${g.heights[0].toFixed(2)} m · 终点高程：${g.heights[1].toFixed(2)} m`,
+      ].join("\n");
+    }
+    if (mode === "azimuth") {
+      const g = this._azimuthGeometry();
+      if (!g) return "";
+      return [
+        "方位角测量完成。",
+        `方位角：${g.azimuth.toFixed(2)}°（0° = 正北，顺时针）`,
+        `水平距离：${g.horizontal.toFixed(2)} m`,
+      ].join("\n");
+    }
     return "";
+  }
+
+  // ============================================================
+  // 内部：测量标注
+  //
+  // 标注落点约定：
+  //   面积              → 图形中心（多边形用面积重心，矩形/圆用几何中心）
+  //   周长 / 长度       → 线的最后一个点
+  //   高距·垂直距离     → 垂线中点
+  //   高距·水平距离     → 水平线中点
+  //   方位角            → 终点
+  // ============================================================
+
+  /**
+   * 标注样式。
+   *
+   * @param {string} text
+   * @param {object} [opts]
+   *   area            true = 蓝底（面积 / 方位角这类结果值）
+   *                   false = 青底（周长 / 长度 / 垂直距这类线性标注）
+   *   clampToGround   默认 true。**高距的标注必须传 false** ——
+   *                   垂线中点在半空、水平线中点在最高处，
+   *                   一旦 CLAMP_TO_GROUND 就会丢掉高程、压到地面，
+   *                   表现就是"标注跑到线的一头去了"。
+   *   offsetY         屏幕纵向偏移（px，负值向上）。不传时按类型给默认：
+   *                   area 类 0，线性标注 -15。
+   *                   方位角标注在箭头尖端，单独传 -15 避开箭头。
+   */
+  _labelStyle(text, opts) {
+    const o = opts || {};
+    const area = o.area === true;
+    const clampToGround = o.clampToGround !== false;
+    const offsetY = o.offsetY === undefined ? (area ? 0 : -15) : o.offsetY;
+
+    const style = {
+      text,
+      font: "600 14px system-ui, Microsoft YaHei, sans-serif",
+      fillColor: Cesium.Color.WHITE,
+      showBackground: true,
+      backgroundColor: Cesium.Color.fromCssColorString(
+        area ? "rgba(18, 52, 110, 0.88)" : "rgba(6, 62, 74, 0.88)",
+      ),
+      pixelOffset: new Cesium.Cartesian2(0, offsetY),
+      backgroundPadding: new Cesium.Cartesian2(9, 5),
+      style: Cesium.LabelStyle.FILL,
+      horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
+      verticalOrigin: Cesium.VerticalOrigin.CENTER,
+      disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      scaleByDistance: new Cesium.NearFarScalar(500, 1.0, 300000, 0.5),
+    };
+    if (clampToGround) {
+      style.heightReference = Cesium.HeightReference.CLAMP_TO_GROUND;
+    }
+    return style;
+  }
+
+  /**
+   * 多边形的面积重心（鞋带公式）。
+   * 自相交或退化时返回 null，由调用方回退到顶点平均值。
+   */
+  _polygonCentroid(lonLats) {
+    const n = lonLats.length;
+    if (n < 3) return null;
+    let a = 0;
+    let cx = 0;
+    let cy = 0;
+    for (let i = 0; i < n; i++) {
+      const [x1, y1] = lonLats[i];
+      const [x2, y2] = lonLats[(i + 1) % n];
+      const cross = x1 * y2 - x2 * y1;
+      a += cross;
+      cx += (x1 + x2) * cross;
+      cy += (y1 + y2) * cross;
+    }
+    if (Math.abs(a) < 1e-12) return null;
+    return [cx / (3 * a), cy / (3 * a)];
+  }
+
+  /** 面积标注落点：图形中心 */
+  _shapeCenter(info) {
+    if (info.type === "polygon") {
+      const n = info.lonLats.length;
+      if (!n) return null;
+      const c =
+        this._polygonCentroid(info.lonLats) ||
+        info.lonLats.reduce((acc, p) => [acc[0] + p[0] / n, acc[1] + p[1] / n], [0, 0]);
+      return Cesium.Cartesian3.fromDegrees(c[0], c[1]);
+    }
+    if (info.type === "rectangle") {
+      const r = info.rectangle;
+      return Cesium.Cartesian3.fromDegrees(
+        (r.west + r.east) / 2,
+        (r.south + r.north) / 2,
+      );
+    }
+    if (info.type === "circle") return info.center.position;
+    return null; // 折线没有面积
+  }
+
+  /** 周长 / 长度标注落点：线的最后一个点 */
+  _lastPointOf(info) {
+    if (info.positions && info.positions.length) {
+      return info.positions[info.positions.length - 1];
+    }
+    const n = info.lonLats.length;
+    if (!n) return null;
+    const p = info.lonLats[n - 1];
+    return Cesium.Cartesian3.fromDegrees(p[0], p[1]);
+  }
+
+  /** 清掉上一轮测量标注（换图 / 清除 / 改开关时都要先调） */
+  _removeMeasureLabels() {
+    if (!this.measureLabelEntities.length) return;
+    this.measureLabelEntities.forEach((e) => this.viewer.entities.remove(e));
+    this.measureLabelEntities = [];
+  }
+
+  /**
+   * 按 measureOptions + 绘制类型生成测量标注。
+   *   measure 为 false 时直接返回（只绘制不测量）。
+   *   面积项只有 polygon / rectangle / circle 有，受 showArea 控制；
+   *   周长 / 长度 / 距离 / 角度受 showPerimeter 控制。
+   */
+  _createMeasureLabels(info) {
+    this._removeMeasureLabels();
+    if (!info || !this.measureOptions.measure) return;
+
+    const opt = this.measureOptions;
+    const out = [];
+    const add = (position, text, style) => {
+      if (!position) return;
+      out.push(
+        this.viewer.entities.add({
+          position,
+          label: this._labelStyle(text, style),
+        }),
+      );
+    };
+
+    switch (info.type) {
+      case "polygon":
+      case "rectangle":
+      case "circle": {
+        if (opt.showArea && info.area != null) {
+          add(this._shapeCenter(info), `面积 ${formatAreaText(info.area)}`, {
+            area: true,
+          });
+        }
+        if (opt.showPerimeter && info.perimeter != null) {
+          add(this._lastPointOf(info), `周长 ${formatLengthText(info.perimeter)}`, {
+            area: false,
+          });
+        }
+        break;
+      }
+      case "polyline": {
+        // 折线没有面积项，只受 showPerimeter 控制
+        if (opt.showPerimeter && info.length != null) {
+          add(this._lastPointOf(info), `长度 ${formatLengthText(info.length)}`, {
+            area: false,
+          });
+        }
+        break;
+      }
+      case "height": {
+        // 垂直 / 水平距离都算"距离类"，归 showPerimeter 管；
+        // 两者在半空中，必须 clampToGround: false
+        if (opt.showPerimeter) {
+          add(
+            info.verticalLabelPos,
+            `垂直 ${formatLengthText(info.verticalDistance)}`,
+            { area: false, clampToGround: false },
+          );
+          add(
+            info.horizontalLabelPos,
+            `水平 ${formatLengthText(info.horizontalDistance)}`,
+            { area: true, clampToGround: false },
+          );
+        }
+        break;
+      }
+      case "azimuth": {
+        // 标注落在箭头尖端，上移 15px 免得被箭头压住
+        if (opt.showPerimeter && info.azimuth != null) {
+          add(
+            info.azimuthLabelPos,
+            `方位角 ${info.azimuth.toFixed(2)}°`,
+            { area: true, offsetY: -15 },
+          );
+        }
+        break;
+      }
+      default:
+        break;
+    }
+
+    this.measureLabelEntities = out;
   }
 }
