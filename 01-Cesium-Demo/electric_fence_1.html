@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>电子围栏 · 光幕</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Cesium.js"></script>
+    <link
+      href="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Widgets/widgets.css"
+      rel="stylesheet"
+    />
+    <style>
+      html,
+      body,
+      #app,
+      #cesiumContainer {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #000;
+      }
+
+      .lil-gui {
+        top: 10px;
+        left: 10px;
+        z-index: 999;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="cesiumContainer"></div>
+    </div>
+
+    <script type="module">
+      const { createApp } = Vue;
+      import GUI from "https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.esm.js";
+
+      // ============================================================
+      // 电子围栏 · 光幕
+      //
+      // 参考实现：Cesium-Examples / 5.3.9、电子围栏.html
+      //
+      // 和同目录的「电子围栏_2」是同一套墙体机制，区别在参数：
+      //   这一版走**竖向**流动（freely = "vertical"），贴图是 wall.png
+      //   —— 一张「透明 → 青色」的竖向渐变，配合 count = 3 反复滚动，
+      //   看上去就是几道半透明光带沿着墙面从下往上扫，像一层光幕。
+      //   另一版走横向，贴图是一排箭头，效果是"跑道箭头绕圈跑"。
+      //
+      // 原理：
+      //   1. 用 wall 实体沿多边形环拉出一圈"墙"
+      //   2. 墙的 material 换成自定义的 DynamicWallMaterialProperty
+      //   3. 着色器里对贴图坐标做 fract(count * st.t + time) 的滚动采样
+      // ============================================================
+
+      /** 围栏范围（成都一带，与参考实现一致） */
+      const FENCE_COORDS = [
+        [104.0185546875, 30.66235300961486],
+        [104.01589393615723, 30.65652022496456],
+        [104.029541015625, 30.65053940942565],
+        [104.0397548675537, 30.65777541087788],
+        [104.03829574584961, 30.66604446357028],
+        [104.0255069732666, 30.667963963897005],
+        [104.0185546875, 30.66235300961486], // 闭合
+      ];
+
+      /** 围栏中心的经纬度，用来摆相机 */
+      const FENCE_CENTER = [104.0279, 30.6602];
+
+      /**
+       * 生成流动墙体的着色器。
+       *
+       *   freely = "vertical" → 光带沿墙的**高度**方向流动（由下到上）
+       *   freely = "standard" → 光带沿墙的**走向**流动（逆时针）
+       *
+       * st 是墙面的纹理坐标：s 沿墙走向 0→1，t 沿墙高 0→1。
+       * fract(count * st.t + direction * time) 让贴图沿墙高按 count 个周期滚动，
+       * time 是 0→1 的锯齿波，正好走完一个整周期，接缝看不出来。
+       *
+       * 注意：Cesium 1.100+ 的材质着色器走 GLSL 300 es，
+       * 取纹理必须用 texture()，老写法 texture2D() 会直接编译失败
+       * （报 "no matching overloaded function found"），
+       * 而且错误发生在渲染管线里，整个场景会停在那一帧。
+       */
+      function buildWallShader(freely) {
+        const sample =
+          freely === "vertical"
+            ? "texture(image, vec2(fract(st.s), fract(count * st.t + direction * time)))"
+            : "texture(image, vec2(fract(count * st.s + direction * time), fract(st.t)))";
+
+        return [
+          "czm_material czm_getMaterial(czm_materialInput materialInput) {",
+          "  czm_material material = czm_getDefaultMaterial(materialInput);",
+          "  vec2 st = materialInput.st;",
+          `  vec4 colorImage = ${sample};`,
+          "  vec4 fragColor;",
+          "  fragColor.rgb = (colorImage.rgb + color.rgb) / 1.0;",
+          "  fragColor = czm_gammaCorrect(fragColor);",
+          "  material.diffuse = colorImage.rgb;",
+          "  material.alpha = colorImage.a;",
+          "  material.emission = fragColor.rgb;",
+          "  return material;",
+          "}",
+        ].join("\n");
+      }
+
+      /** 两种流动方式各注册一个材质，面板切换时换 getType() 的返回值即可 */
+      const WALL_MATERIAL_TYPES = {
+        standard: "FenceWallStandard",
+        vertical: "FenceWallVertical",
+      };
+
+      function registerWallMaterials() {
+        Object.entries(WALL_MATERIAL_TYPES).forEach(([freely, type]) => {
+          Cesium.Material._materialCache.addMaterial(type, {
+            fabric: {
+              type,
+              uniforms: {
+                color: Cesium.Color.CYAN,
+                image: Cesium.Material.DefaultImageId,
+                time: 0,
+                count: 3.0,
+                direction: -1.0,
+              },
+              source: buildWallShader(freely),
+            },
+            translucent: function () {
+              return true;
+            },
+          });
+        });
+      }
+
+      /**
+       * 动态墙材质。
+       *
+       * 注意 color 必须给 Cesium.Color，不能给 CSS 字符串 ——
+       * getValue 里走的是 Property.getValueOrClonedDefault，它不会做类型转换。
+       */
+      function DynamicWallMaterialProperty(options) {
+        options = options || {};
+        this._definitionChanged = new Cesium.Event();
+        this._color = undefined;
+        this._colorSubscription = undefined;
+
+        // 原实现这里写的是 Color.BLUE（漏了 Cesium. 前缀，Color 是未定义的）
+        this.color = options.color || Cesium.Color.CYAN;
+        this.duration = options.duration || 1500;
+        this.trailImage = options.trailImage;
+        this.count = options.count != null ? options.count : 3;
+        this.direction = options.direction != null ? options.direction : -1;
+        this.freely = options.freely || "vertical";
+        this._time = Date.now();
+      }
+
+      Object.defineProperties(DynamicWallMaterialProperty.prototype, {
+        isConstant: {
+          get: function () {
+            return false;
+          },
+        },
+        definitionChanged: {
+          get: function () {
+            return this._definitionChanged;
+          },
+        },
+        color: Cesium.createPropertyDescriptor("color"),
+      });
+
+      // 流动方式变了就换材质类型，Cesium 会重建 material
+      DynamicWallMaterialProperty.prototype.getType = function () {
+        return this.freely === "vertical"
+          ? WALL_MATERIAL_TYPES.vertical
+          : WALL_MATERIAL_TYPES.standard;
+      };
+
+      DynamicWallMaterialProperty.prototype.getValue = function (time, result) {
+        if (!Cesium.defined(result)) {
+          result = {};
+        }
+        result.color = Cesium.Property.getValueOrClonedDefault(
+          this._color,
+          time,
+          Cesium.Color.WHITE,
+          result.color,
+        );
+        result.image = this.trailImage;
+        result.count = this.count;
+        result.direction = this.direction;
+        if (this.duration) {
+          result.time = ((Date.now() - this._time) % this.duration) / this.duration;
+        }
+        return result;
+      };
+
+      DynamicWallMaterialProperty.prototype.equals = function (other) {
+        return (
+          this === other ||
+          (other instanceof DynamicWallMaterialProperty &&
+            Cesium.Property.equals(this._color, other._color))
+        );
+      };
+
+      createApp({
+        data() {
+          return {
+            viewer: null,
+            imageryLayer: null,
+            wallEntity: null,
+            wallMaterial: null,
+            wallHeight: 500,
+            params: null,
+          };
+        },
+        async mounted() {
+          registerWallMaterials();
+          this.initMap();
+          this.loadWall();
+          this.addlilgui();
+        },
+        beforeUnmount() {
+          if (this.myLilGui) {
+            this.myLilGui.destroy();
+            this.myLilGui = null;
+          }
+        },
+        methods: {
+          initMap() {
+            let viewer = new Cesium.Viewer("cesiumContainer", {
+              baseLayer: false,
+              animation: false,
+              timeline: false,
+              fullscreenButton: false,
+              infoBox: false,
+              geocoder: false,
+              homeButton: false,
+              sceneModePicker: false,
+              baseLayerPicker: false,
+              navigationHelpButton: false,
+              selectionIndicator: false,
+              shouldAnimate: true,
+            });
+
+            window.viewer = viewer;
+            viewer.scene.debugShowFramesPerSecond = true;
+            viewer.scene.globe.enableLighting = false;
+            viewer.scene.fog.enabled = true;
+            viewer.scene.fog.density = 0.00008;
+            viewer.scene.skyAtmosphere.show = true;
+            viewer._cesiumWidget._creditContainer.style.display = "none";
+
+            let imageryLayer = viewer.imageryLayers.addImageryProvider(
+              new Cesium.UrlTemplateImageryProvider({
+                url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                maximumLevel: 18,
+              }),
+            );
+
+            this.viewer = viewer;
+            this.imageryLayer = imageryLayer;
+            this.resetCamera();
+            return viewer;
+          },
+
+          /** 沿围栏环拉出一圈墙 */
+          loadWall() {
+            const viewer = this.viewer;
+            if (!viewer) return;
+
+            const n = FENCE_COORDS.length;
+
+            this.wallMaterial = new DynamicWallMaterialProperty({
+              trailImage: "./data/image/wall.png",
+              color: Cesium.Color.CYAN,
+              duration: 1500,
+              count: 3,
+              direction: -1,
+              freely: "vertical",
+            });
+
+            // 用 CallbackProperty 让墙高能被面板实时改
+            const heights = new Cesium.CallbackProperty(
+              () => new Array(n).fill(this.wallHeight),
+              false,
+            );
+
+            this.wallEntity = viewer.entities.add({
+              wall: {
+                positions: Cesium.Cartesian3.fromDegreesArray(
+                  FENCE_COORDS.reduce((acc, p) => acc.concat(p), []),
+                ),
+                maximumHeights: heights,
+                // 参考实现里写成了 minimunHeights（拼写错误），
+                // Cesium 会直接忽略这个键，靠默认值 0 兜住了。这里用正确的名字。
+                minimumHeights: new Array(n).fill(0),
+                material: this.wallMaterial,
+              },
+            });
+          },
+
+          addlilgui() {
+            let myLilGui = new GUI({ title: "电子围栏 · 参数面板" });
+            this.myLilGui = myLilGui;
+
+            const params = {
+              color: "#00ffff",
+              height: 500,
+              visible: true,
+              freely: "vertical",
+              reverse: true,
+              count: 3,
+              duration: 1500,
+              resetCamera: () => this.resetCamera(),
+            };
+            this.params = params;
+            this.wallHeight = params.height;
+
+            // ---- 围栏 ----
+            const fenceFolder = myLilGui.addFolder("电子围栏");
+            fenceFolder
+              .addColor(params, "color")
+              .name("围栏颜色")
+              .onChange((v) => {
+                this.wallMaterial.color = Cesium.Color.fromCssColorString(v);
+              });
+            fenceFolder
+              .add(params, "height", 50, 1000, 10)
+              .name("墙体高度(m)")
+              .onChange((v) => {
+                this.wallHeight = v;
+              });
+            fenceFolder
+              .add(params, "visible")
+              .name("显示围栏")
+              .onChange((v) => {
+                this.wallEntity.show = v;
+              });
+
+            // ---- 流动效果 ----
+            const flowFolder = myLilGui.addFolder("流动效果");
+            flowFolder
+              .add(params, "freely", {
+                "由下到上（沿墙高）": "vertical",
+                "逆时针（沿墙走向）": "standard",
+              })
+              .name("流动方式")
+              .onChange((v) => {
+                this.wallMaterial.freely = v;
+              });
+            flowFolder
+              .add(params, "reverse")
+              .name("反向流动")
+              .onChange((v) => {
+                this.wallMaterial.direction = v ? -1 : 1;
+              });
+            flowFolder
+              .add(params, "count", 1, 20, 1)
+              .name("光带层数")
+              .onChange((v) => {
+                this.wallMaterial.count = v;
+              });
+            flowFolder
+              .add(params, "duration", 300, 6000, 100)
+              .name("流动周期(ms)")
+              .onChange((v) => {
+                this.wallMaterial.duration = v;
+              });
+
+            // ---- 视图 ----
+            const viewFolder = myLilGui.addFolder("视图");
+            viewFolder.add(params, "resetCamera").name("重置视角");
+
+            // ---- 图层控制 ----
+            const layerFolder = myLilGui.addFolder("图层控制");
+            layerFolder.add(this.imageryLayer, "show").name("影像图层显示/隐藏");
+            layerFolder
+              .add(this.imageryLayer, "alpha", 0, 1, 0.01)
+              .name("影像图层透明度");
+          },
+
+          resetCamera() {
+            if (!this.viewer) return;
+            // 墙高 500m，站远一点才能看全：
+            // 高度 2500m、水平距离约 3.5km，俯角 -35° 让围栏落在画面中心。
+            this.viewer.camera.flyTo({
+              destination: Cesium.Cartesian3.fromDegrees(
+                FENCE_CENTER[0],
+                FENCE_CENTER[1] - 0.0314,
+                2500,
+              ),
+              orientation: {
+                heading: Cesium.Math.toRadians(0),
+                pitch: Cesium.Math.toRadians(-35),
+                roll: Cesium.Math.toRadians(0),
+              },
+              duration: 2,
+            });
+          },
+        },
+      }).mount("#app");
+    </script>
+  </body>
+</html>
