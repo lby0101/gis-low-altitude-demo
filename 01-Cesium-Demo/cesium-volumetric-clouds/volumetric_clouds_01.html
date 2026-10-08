@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>体积云 01 · 射线步进</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Cesium.js"></script>
+    <link
+      href="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Widgets/widgets.css"
+      rel="stylesheet"
+    />
+    <style>
+      html,
+      body,
+      #app,
+      #cesiumContainer {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #000;
+      }
+
+      .lil-gui {
+        top: 10px;
+        left: 10px;
+        z-index: 999;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="cesiumContainer"></div>
+    </div>
+
+    <script type="module">
+      const { createApp } = Vue;
+      import GUI from "https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.esm.js";
+
+      // ============================================================
+      // 体积云 01 · 射线步进
+      //
+      // 这一篇只做一件事：让天上出现一团云。
+      // 不做光照、不做阴影、不做时间累积 —— 密度用一个简单的
+      // hash 噪声凑出来，能看出「有团东西在那儿」就够了。
+      //
+      // 核心就三步：
+      //   1. 构造云壳（一个与椭球相切的球）
+      //   2. 从相机出发，沿每个像素的视线方向求交，拿到进出云层的 t
+      //   3. 在 [tNear, tFar] 区间里等距采样密度，累加起来
+      //
+      // 参考实现：cesium-volumetric-clouds（MIT）
+      // ============================================================
+
+      /** 云壳球心处的「基准半径」，源库的取值 */
+      const BOTTOM_RADIUS = 6360000;
+
+      const CLOUD_SHADER = `
+uniform sampler2D colorTexture;
+in vec2 v_textureCoordinates;
+
+// —— 相机 ——（全部在「球坐标系」里：原点 = 云壳球心）
+uniform vec3  u_cameraPositionSphere;
+uniform vec3  u_cameraDirection;
+uniform vec3  u_cameraRight;
+uniform vec3  u_cameraUp;
+uniform vec2  u_tanHalfFov;
+
+// —— 云壳 ——
+uniform float u_bottomRadius;
+uniform float u_minHeight;     // 云底高度（相对基准半径）
+uniform float u_maxHeight;     // 云顶高度
+
+// —— 步进 ——
+uniform float u_stepCount;
+uniform float u_maxDistance;
+
+// —— 密度 ——
+uniform float u_densityScale;
+uniform float u_coverage;
+uniform vec3  u_cloudColor;
+
+// 注意：out_FragColor 由 Cesium 的 PostProcessStage 自动声明，
+// 这里再写一遍会报 'out_FragColor' : redefinition。
+
+// ------------------------------------------------------------
+// 射线与球求交。
+// 返回 (近交点, 远交点)；没打中返回 (-1, -1)。
+// 要求 dir 已归一化。
+// 推导：把 |o + t*d| = r 展开成 t² + 2(o·d)t + (o·o - r²) = 0
+//       记 b = o·d，c = o·o - r²，则 t = -b ± sqrt(b² - c)
+// ------------------------------------------------------------
+vec2 raySphereIntersection(vec3 rayOrigin, vec3 rayDirection, float radius) {
+  float b = dot(rayOrigin, rayDirection);
+  float c = dot(rayOrigin, rayOrigin) - radius * radius;
+  float h = b * b - c;
+  if (h < 0.0) {
+    return vec2(-1.0);
+  }
+  h = sqrt(h);
+  return vec2(-b - h, -b + h);
+}
+
+// ------------------------------------------------------------
+// 射线是否打中地球（球心在原点，地面半径 = u_bottomRadius）。
+// 不做这个判断的话，相机在云层之下、视线朝下时，射线会穿过地球、
+// 从**另一侧**再次进入云层所在的半径区间 —— 结果就是「地面以下有云」。
+// ------------------------------------------------------------
+bool rayIntersectsGround(vec3 rayOrigin, vec3 rayDirection) {
+  float r = length(rayOrigin);
+  float mu = dot(rayOrigin, rayDirection) / r;
+  return mu < 0.0 && r * r * (mu * mu - 1.0) + u_bottomRadius * u_bottomRadius >= 0.0;
+}
+
+// ------------------------------------------------------------
+// 一个够用的 3D 值噪声。真项目里用预计算的 Perlin-Worley 纹理，
+// 这里为了自包含，直接在着色器里算。
+// ------------------------------------------------------------
+float hash13(vec3 p) {
+  p = fract(p * 0.3183099 + vec3(0.71, 0.113, 0.419));
+  p *= 17.0;
+  return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float valueNoise(vec3 x) {
+  vec3 i = floor(x);
+  vec3 f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);   // smoothstep，避免格子感
+  return mix(
+    mix(mix(hash13(i + vec3(0.0, 0.0, 0.0)), hash13(i + vec3(1.0, 0.0, 0.0)), f.x),
+        mix(hash13(i + vec3(0.0, 1.0, 0.0)), hash13(i + vec3(1.0, 1.0, 0.0)), f.x), f.y),
+    mix(mix(hash13(i + vec3(0.0, 0.0, 1.0)), hash13(i + vec3(1.0, 0.0, 1.0)), f.x),
+        mix(hash13(i + vec3(0.0, 1.0, 1.0)), hash13(i + vec3(1.0, 1.0, 1.0)), f.x), f.y),
+    f.z);
+}
+
+float fbm(vec3 p) {
+  float sum = 0.0;
+  float amp = 0.5;
+  for (int i = 0; i < 4; i++) {
+    sum += amp * valueNoise(p);
+    p *= 2.03;      // 加一点非整数倍，避免各层对齐
+    amp *= 0.5;
+  }
+  return sum;
+}
+
+// ------------------------------------------------------------
+// 密度场。输入是球坐标系下的位置。
+//
+// 两个因子相乘：
+//   高度梯度 —— 云底和云顶的密度为 0，中间最浓
+//   噪声     —— 决定哪里浓哪里淡
+// ------------------------------------------------------------
+float densityAt(vec3 positionSphere) {
+  float height = length(positionSphere) - (u_bottomRadius + u_minHeight);
+  float layerThickness = u_maxHeight - u_minHeight;
+  float heightFraction = clamp(height / layerThickness, 0.0, 1.0);
+
+  // 底部 25% 渐入、顶部 40% 渐出
+  float profile =
+    smoothstep(0.0, 0.25, heightFraction) *
+    smoothstep(1.0, 0.60, heightFraction);
+
+  // 噪声域：0.00025 约等于 4km 一个特征尺度
+  float n = fbm(positionSphere * 0.0005);
+
+  // coverage 越高，能过阈值的噪声越多 —— 云越满
+  float shaped = smoothstep(1.0 - u_coverage, 1.0 - u_coverage + 0.35, n);
+
+  return max(shaped * profile * u_densityScale, 0.0);
+}
+
+void main(void) {
+  vec4 sceneColor = texture(colorTexture, v_textureCoordinates);
+
+  // —— 1. 从像素坐标构造世界空间视线方向 ——
+  vec2 ndc = v_textureCoordinates * 2.0 - 1.0;
+  vec3 rayDirection = normalize(
+    u_cameraDirection +
+    u_cameraRight * (ndc.x * u_tanHalfFov.x) +
+    u_cameraUp    * (ndc.y * u_tanHalfFov.y)
+  );
+
+  // —— 2. 和云壳求交，拿到进出云层的区间 ——
+  float innerRadius = u_bottomRadius + u_minHeight;
+  float outerRadius = u_bottomRadius + u_maxHeight;
+
+  vec3 origin = u_cameraPositionSphere;
+  float cameraRadius = length(origin);
+
+  vec2 outerHit = raySphereIntersection(origin, rayDirection, outerRadius);
+  // 两个判断缺一不可：
+  //   outerHit.y <= 0  →  交点全在相机背后。相机在球外、视线朝上时就是这种情况，
+  //                       球在身后。只判「有没有实根」是不够的。
+  if (outerHit.y <= 0.0) {
+    out_FragColor = sceneColor;
+    return;
+  }
+
+  vec2 innerHit = raySphereIntersection(origin, rayDirection, innerRadius);
+  bool hitsGround = rayIntersectsGround(origin, rayDirection);
+
+  float tNear;
+  float tFar;
+  if (cameraRadius > outerRadius) {
+    // 相机在云层之上：从穿入外球开始
+    tNear = max(outerHit.x, 0.0);
+    // 如果视线会打到内球，就在那儿结束（穿出云底）；否则到外球背面
+    tFar = innerHit.x > 0.0 ? innerHit.x : outerHit.y;
+  } else if (cameraRadius > innerRadius) {
+    // 相机就在云层里：从眼前开始
+    tNear = 0.0;
+    tFar = innerHit.x > 0.0 ? innerHit.x : outerHit.y;
+  } else {
+    // 相机在云层之下。
+    // 视线朝下时射线会扎进地里 —— 这时看不到云，直接返回原色。
+    // （不返回的话，射线会从地球另一侧穿回云层半径区间，画出「地下的云」）
+    if (hitsGround) {
+      out_FragColor = sceneColor;
+      return;
+    }
+    tNear = max(innerHit.y, 0.0);
+    tFar = outerHit.y;
+  }
+
+  tFar = min(tFar, tNear + u_maxDistance);
+  if (tFar <= tNear) {
+    out_FragColor = sceneColor;
+    return;
+  }
+
+  // —— 3. 等距步进，累加密度 ——
+  float stepLength = (tFar - tNear) / u_stepCount;
+  float transmittance = 1.0;
+  vec3 scattered = vec3(0.0);
+
+  for (float i = 0.0; i < 512.0; i += 1.0) {
+    if (i >= u_stepCount) break;
+
+    float t = tNear + (i + 0.5) * stepLength;
+    vec3 positionSphere = origin + rayDirection * t;
+
+    float density = densityAt(positionSphere);
+    if (density > 0.0) {
+      // 这一小段的「光学厚度」= 消光系数 × 密度 × 步长
+      // 0.003 是调出来的：密度 1、路径 1.5km 时约 99% 不透明
+      float sampleTransmittance = exp(-density * stepLength * 0.003);
+      // 能量守恒：这一段散射进来的光 = 吸收掉的量
+      scattered += transmittance * (1.0 - sampleTransmittance) * u_cloudColor;
+      transmittance *= sampleTransmittance;
+      if (transmittance < 0.01) break;   // 已经不透光了，提前退出
+    }
+  }
+
+  vec3 cloudColor = scattered;
+  float cloudAlpha = 1.0 - transmittance;
+
+  out_FragColor = vec4(mix(sceneColor.rgb, cloudColor, cloudAlpha), sceneColor.a);
+}
+`;
+
+      createApp({
+        data() {
+          return {
+            viewer: null,
+            imageryLayer: null,
+            cloudStage: null,
+            scratch: {},
+            params: {
+              // 云层
+              baseHeight: 1200,
+              thickness: 1800,
+              densityScale: 1.0,
+              coverage: 0.45,
+              cloudColor: "#ffffff",
+              // 步进
+              stepCount: 64,
+              maxDistance: 40000,
+            },
+          };
+        },
+        async mounted() {
+          this.initMap();
+          this.loadTileset();
+          this.addClouds();
+          this.addlilgui();
+        },
+        beforeUnmount() {
+          if (this.myLilGui) {
+            this.myLilGui.destroy();
+            this.myLilGui = null;
+          }
+        },
+        methods: {
+          initMap() {
+            let viewer = new Cesium.Viewer("cesiumContainer", {
+              baseLayer: false,
+              animation: false,
+              timeline: false,
+              fullscreenButton: false,
+              infoBox: false,
+              geocoder: false,
+              homeButton: false,
+              sceneModePicker: false,
+              baseLayerPicker: false,
+              navigationHelpButton: false,
+              selectionIndicator: false,
+              shouldAnimate: true,
+            });
+
+            window.viewer = viewer;
+            viewer.scene.debugShowFramesPerSecond = true;
+            viewer.scene.globe.enableLighting = false;
+            viewer.scene.fog.enabled = false;
+            viewer.scene.skyAtmosphere.show = true;
+            viewer._cesiumWidget._creditContainer.style.display = "none";
+
+            let imageryLayer = viewer.imageryLayers.addImageryProvider(
+              new Cesium.UrlTemplateImageryProvider({
+                url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                maximumLevel: 18,
+              }),
+            );
+
+            this.viewer = viewer;
+            this.imageryLayer = imageryLayer;
+
+            // 相机放在云层之上，略微俯视 —— 能同时看到云顶和地平线
+            viewer.camera.setView({
+              destination: Cesium.Cartesian3.fromDegrees(116.4, 39.9, 7000),
+              orientation: {
+                heading: Cesium.Math.toRadians(0),
+                pitch: Cesium.Math.toRadians(-17),
+                roll: 0,
+              },
+            });
+            return viewer;
+          },
+          async loadTileset() {
+            try {
+              this.statusText = "正在加载 3D Tiles 白模…";
+              this.tileset = await Cesium.Cesium3DTileset.fromUrl(
+                "../data/tileset/baimo/tileset.json",
+                {
+                  maximumScreenSpaceError: 16,
+                  maximumMemoryUsage: 2048,
+                },
+              );
+              this.viewer.scene.primitives.add(this.tileset);
+              await this.viewer.zoomTo(this.tileset);
+              this.statusText = "模型加载完成。点击“绘制矩形”选择压平范围。";
+            } catch (error) {
+              console.warn("3D Tiles 加载失败：", error);
+              this.statusText = `3D Tiles 加载失败：${error.message}`;
+            }
+          },
+
+          /**
+           * 每帧算一次「云壳球心」。
+           *
+           * 这个球要满足：半径固定为 BOTTOM_RADIUS，且与椭球在**相机的地面投影点**
+           * 处相切。所以球心 = 地面点 - 法线 * BOTTOM_RADIUS。
+           *
+           * 直观理解：球心会落在离地心很近的地方，整个球几乎是「以地心为球心、
+           * 半径 6360km」的一个球，只是沿法线挪了一点，好让球面正好压在地面点上。
+           * 这样云层高度就永远相对「脚下的地面」来算。
+           */
+          computeSphereCenter() {
+            const s = this.scratch;
+            const ellipsoid = this.viewer.scene.globe.ellipsoid;
+            const cameraPosition = this.viewer.camera.positionWC;
+
+            if (!s.carto) s.carto = new Cesium.Cartographic();
+            if (!s.surface) s.surface = new Cesium.Cartesian3();
+            if (!s.normal) s.normal = new Cesium.Cartesian3();
+            if (!s.center) s.center = new Cesium.Cartesian3();
+
+            const carto = Cesium.Cartographic.fromCartesian(
+              cameraPosition,
+              ellipsoid,
+              s.carto,
+            );
+            carto.height = 0;
+            const surface = Cesium.Cartographic.toCartesian(
+              carto,
+              ellipsoid,
+              s.surface,
+            );
+            const normal = ellipsoid.geodeticSurfaceNormal(surface, s.normal);
+
+            const center = Cesium.Cartesian3.multiplyByScalar(
+              normal,
+              BOTTOM_RADIUS,
+              s.center,
+            );
+            Cesium.Cartesian3.subtract(surface, center, center);
+
+            // 相对相机的位置（球坐标系里的相机位置 = 球心 - 相机位置 取反）
+            const centerRelative = Cesium.Cartesian3.subtract(
+              center,
+              cameraPosition,
+              s.centerRelative || (s.centerRelative = new Cesium.Cartesian3()),
+            );
+            return Cesium.Cartesian3.negate(
+              centerRelative,
+              s.cameraPositionSphere ||
+                (s.cameraPositionSphere = new Cesium.Cartesian3()),
+            );
+          },
+
+          addClouds() {
+            const viewer = this.viewer;
+            const p = this.params;
+
+            this.cloudStage = new Cesium.PostProcessStage({
+              name: "volumetricClouds01",
+              fragmentShader: CLOUD_SHADER,
+              uniforms: {
+                // 相机在球坐标系里的位置
+                u_cameraPositionSphere: () => this.computeSphereCenter(),
+                u_cameraDirection: () => viewer.camera.directionWC,
+                u_cameraRight: () => viewer.camera.rightWC,
+                u_cameraUp: () => viewer.camera.upWC,
+                u_tanHalfFov: () => {
+                  const fovy = viewer.camera.frustum.fovy;
+                  const aspect = viewer.camera.frustum.aspectRatio;
+                  const tanY = Math.tan(fovy * 0.5);
+                  if (!this._tanHalfFov)
+                    this._tanHalfFov = new Cesium.Cartesian2();
+                  this._tanHalfFov.x = tanY * aspect;
+                  this._tanHalfFov.y = tanY;
+                  return this._tanHalfFov;
+                },
+
+                u_bottomRadius: () => BOTTOM_RADIUS,
+                u_minHeight: () => p.baseHeight,
+                u_maxHeight: () => p.baseHeight + p.thickness,
+
+                u_stepCount: () => p.stepCount,
+                u_maxDistance: () => p.maxDistance,
+
+                u_densityScale: () => p.densityScale,
+                u_coverage: () => p.coverage,
+                u_cloudColor: () =>
+                  Cesium.Color.fromCssColorString(p.cloudColor),
+              },
+            });
+
+            viewer.scene.postProcessStages.add(this.cloudStage);
+          },
+
+          addlilgui() {
+            let myLilGui = new GUI({ title: "体积云 01 · 射线步进" });
+            this.myLilGui = myLilGui;
+            const p = this.params;
+
+            const cloudFolder = myLilGui.addFolder("云层");
+            cloudFolder.add(p, "baseHeight", 200, 8000, 50).name("云底高度(m)");
+            cloudFolder.add(p, "thickness", 300, 8000, 50).name("云层厚度(m)");
+            cloudFolder.add(p, "densityScale", 0.05, 3, 0.05).name("密度倍率");
+            cloudFolder.add(p, "coverage", 0.05, 0.95, 0.01).name("覆盖率");
+            cloudFolder.addColor(p, "cloudColor").name("云的底色");
+
+            const marchFolder = myLilGui.addFolder("步进");
+            marchFolder.add(p, "stepCount", 8, 512, 1).name("采样步数");
+            marchFolder
+              .add(p, "maxDistance", 5000, 300000, 1000)
+              .name("最远步进距离(m)");
+
+            const viewFolder = myLilGui.addFolder("视图");
+            viewFolder
+              .add({ fn: () => this.resetCamera() }, "fn")
+              .name("重置视角");
+
+            const layerFolder = myLilGui.addFolder("图层控制");
+            layerFolder
+              .add(this.imageryLayer, "show")
+              .name("影像图层显示/隐藏");
+            layerFolder
+              .add(this.imageryLayer, "alpha", 0, 1, 0.01)
+              .name("影像图层透明度");
+          },
+
+          resetCamera() {
+            if (!this.viewer) return;
+            this.viewer.camera.setView({
+              destination: Cesium.Cartesian3.fromDegrees(116.4, 39.9, 7000),
+              orientation: {
+                heading: Cesium.Math.toRadians(0),
+                pitch: Cesium.Math.toRadians(-17),
+                roll: 0,
+              },
+            });
+          },
+        },
+      }).mount("#app");
+    </script>
+  </body>
+</html>

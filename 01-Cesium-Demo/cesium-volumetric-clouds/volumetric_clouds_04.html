@@ -1,0 +1,1087 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>体积云 04 · 光照</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Cesium.js"></script>
+    <link
+      href="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Widgets/widgets.css"
+      rel="stylesheet"
+    />
+    <style>
+      html,
+      body,
+      #app,
+      #cesiumContainer {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #000;
+      }
+
+      .lil-gui {
+        top: 10px;
+        left: 10px;
+        z-index: 999;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="cesiumContainer"></div>
+    </div>
+
+    <script type="module">
+      const { createApp } = Vue;
+      import GUI from "https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.esm.js";
+
+      // ============================================================
+      // 体积云 04 · 光照
+      //
+      // 前三篇的云都是「一片纯白」—— 因为合成时不管三七二十一
+      // 都乘同一个 u_cloudColor，没有光照。
+      //
+      // 这一篇补上光照。三件事：
+      //
+      //   ① Beer-Lambert 透射
+      //      从当前采样点朝**太阳方向**再步进一次，累加光学厚度 τ，
+      //      透射率就是 exp(-τ)。τ 大 → 光被挡住 → 暗。
+      //
+      //   ② Oz 多重散射近似
+      //      只用单次散射的话，厚云会黑成一团（τ 一大 exp(-τ) 就没了）。
+      //      Oz 的做法是叠 8 层：每层把衰减系数和相函数各减半，
+      //      等于把「光在云里弹了好几次」的效果近似出来。
+      //      实测 τ=5 时多重散射比单次高约 99 倍。
+      //
+      //   ③ Beer-Powder 暗边
+      //      radiance *= 1 - powderScale * exp(-extinction * powderExponent)
+      //      消光小的地方（云的稀疏边缘）因子接近 1-0.8=0.2 → 压暗；
+      //      消光大的地方（云芯）因子接近 1 → 不受影响。
+      //      所以云会有一圈「糖霜」似的暗边。
+      //
+      // 相函数用双叶 Henyey-Greenstein：前向 0.8 + 后向 -0.2。
+      // 这就是为什么逆光看云边缘会特别亮（前向散射）。
+      //
+      // 参考实现：cesium-volumetric-clouds（MIT）
+      // ============================================================
+
+      /** 云壳球心处的「基准半径」，源库的取值 */
+      const BOTTOM_RADIUS = 6360000;
+
+      /**
+       * ===== 本篇新增：时间预设 =====
+       * 演示点在 116.4°E，当地时 = UTC + 8。
+       * 日期取夏至（2026-06-21），北纬 39.9° 正午的太阳天顶角 = 16.5°。
+       */
+      const TIME_PRESETS = {
+        "清晨 06:00": "2026-06-20T22:00:00Z",
+        "正午 12:00": "2026-06-21T04:00:00Z",
+        "黄昏 19:00": "2026-06-21T11:00:00Z",
+        "夜晚 22:00": "2026-06-21T14:00:00Z",
+      };
+
+      const CLOUD_SHADER = `
+uniform sampler2D colorTexture;
+// ===== 本篇新增：场景深度 =====
+// PostProcessStage 会自动绑定这一张 —— 它是**当前帧**的深度，
+// 包含地形、3D Tiles、建筑等所有不透明物体。
+uniform sampler2D depthTexture;
+in vec2 v_textureCoordinates;
+
+// —— 相机 ——（全部在「球坐标系」里：原点 = 云壳球心）
+uniform vec3  u_cameraPositionSphere;
+uniform vec3  u_cameraDirection;
+uniform vec3  u_cameraRight;
+uniform vec3  u_cameraUp;
+uniform vec2  u_tanHalfFov;
+
+// —— 云壳 ——
+uniform float u_bottomRadius;
+uniform float u_minHeight;     // 云底高度（相对基准半径）
+uniform float u_maxHeight;     // 云顶高度
+
+// —— 步进 ——
+uniform float u_stepCount;
+uniform float u_maxDistance;
+
+// —— 密度 ——
+uniform float u_densityScale;
+uniform float u_coverage;
+uniform vec3  u_cloudColor;
+
+// ===== 本篇新增：形状噪声 =====
+// 两张预计算的 3D 噪声纹理，都用 WebGL2 的 sampler3D 采样
+uniform highp sampler3D shapeTexture;        // 128³  Perlin-Worley，管轮廓
+uniform highp sampler3D shapeDetailTexture;  // 32³   Worley fbm，管细节
+uniform float u_shapeRepeat;          // 形状纹理的平铺密度
+uniform float u_shapeDetailRepeat;    // 细节纹理的平铺密度
+uniform float u_shapeAmount;          // 形状噪声的影响强度
+uniform float u_shapeDetailAmount;    // 细节侵蚀的强度
+uniform float u_shapeAlteringBias;    // 高度梯度的偏置（越小云越「上重下轻」）
+uniform float u_coverageFilterWidth;  // 覆盖率的过渡宽度
+uniform float u_profileLinear;        // 层内剖面的线性项
+uniform float u_profileConstant;      // 层内剖面的常数项
+
+// ===== 本篇新增：场景遮挡 =====
+uniform float u_depthTestEnabled;     // 0 / 1
+uniform float u_occlusionBandScale;   // 软化带宽度（占云前表面距离的比例）
+uniform float u_debugSceneDepth;      // 1 = 把场景深度可视化
+
+// ===== 本篇新增：光照 =====
+uniform float u_lightingEnabled;      // 0 = 退回前三篇的纯白叠加
+uniform vec3  u_sunDirection;         // 指向太阳的单位向量
+uniform vec3  u_sunColor;             // 太阳色（真实大气透射留到第 8 篇）
+uniform vec3  u_skyColor;             // 天空环境光颜色
+uniform float u_skyLightScale;        // 天空光强度
+uniform float u_extinction;           // 消光系数
+uniform float u_albedo;               // 单次散射反照率（1 = 纯散射，无吸收）
+uniform float u_powderScale;          // Beer-Powder 强度
+uniform float u_powderExponent;       // Beer-Powder 指数
+uniform float u_multiScatterOctaves;  // Oz 多重散射阶数（1 = 只有单次散射）
+uniform float u_exposure;             // 曝光
+uniform float u_sunStepCount;         // 朝太阳步进的次数
+uniform float u_sunStepSize;          // 朝太阳步进的初始步长
+uniform float u_sunStepScale;         // 步长增长比例
+uniform float u_lightDebug;           // 光照调试视图（0=关）
+
+// 注意：out_FragColor 由 Cesium 的 PostProcessStage 自动声明，
+// 这里再写一遍会报 'out_FragColor' : redefinition。
+
+// ------------------------------------------------------------
+// 射线与球求交。
+// 返回 (近交点, 远交点)；没打中返回 (-1, -1)。
+// 要求 dir 已归一化。
+// 推导：把 |o + t*d| = r 展开成 t² + 2(o·d)t + (o·o - r²) = 0
+//       记 b = o·d，c = o·o - r²，则 t = -b ± sqrt(b² - c)
+// ------------------------------------------------------------
+vec2 raySphereIntersection(vec3 rayOrigin, vec3 rayDirection, float radius) {
+  float b = dot(rayOrigin, rayDirection);
+  float c = dot(rayOrigin, rayOrigin) - radius * radius;
+  float h = b * b - c;
+  if (h < 0.0) {
+    return vec2(-1.0);
+  }
+  h = sqrt(h);
+  return vec2(-b - h, -b + h);
+}
+
+// ------------------------------------------------------------
+// 射线是否打中地球（球心在原点，地面半径 = u_bottomRadius）。
+// 不做这个判断的话，相机在云层之下、视线朝下时，射线会穿过地球、
+// 从**另一侧**再次进入云层所在的半径区间 —— 结果就是「地面以下有云」。
+// ------------------------------------------------------------
+bool rayIntersectsGround(vec3 rayOrigin, vec3 rayDirection) {
+  float r = length(rayOrigin);
+  float mu = dot(rayOrigin, rayDirection) / r;
+  return mu < 0.0 && r * r * (mu * mu - 1.0) + u_bottomRadius * u_bottomRadius >= 0.0;
+}
+
+// ------------------------------------------------------------
+// 【本篇核心】从深度纹理还原场景表面的视空间深度。
+//
+// 两个要点：
+//   1. 深度值要**直接读 .r**，不要 czm_unpackDepth ——
+//      PostProcessStage 绑的是场景原始的深度模板纹理，
+//      不是 Cesium 内部那种打包成 RGBA 的格式。
+//   2. 用 czm_windowToEyeCoordinates 还原，它会自动处理
+//      对数深度 / 线性深度两种情况，不用自己判断。
+//
+// 天空区域没有场景几何，深度接近 1.0，判为无效。
+// 不排除它的话，整片天空都会被当成「被遮挡」。
+// ------------------------------------------------------------
+float readSceneEyeDepth(vec2 uv, out bool valid) {
+  float depthOrLogDepth = texture(depthTexture, uv).r;
+  valid = depthOrLogDepth > 1e-7 && depthOrLogDepth < 1.0 - 1e-7;
+  if (!valid) {
+    return 0.0;
+  }
+  vec4 positionEC = czm_windowToEyeCoordinates(gl_FragCoord.xy, depthOrLogDepth);
+  float eyeDepth = -positionEC.z / positionEC.w;
+  valid = eyeDepth > 0.0 && eyeDepth == eyeDepth;   // 最后一项排除 NaN
+  return valid ? eyeDepth : 0.0;
+}
+
+// ------------------------------------------------------------
+// 工具：把 x 从 [min1, max1] 重映射到 [0, 1] 并夹紧
+// ------------------------------------------------------------
+float remapClamped(float x, float min1, float max1) {
+  return clamp((x - min1) / (max1 - min1), 0.0, 1.0);
+}
+
+// ------------------------------------------------------------
+// 【本篇核心 ①】半圆变换 —— 高度梯度
+//
+//   biased = hf^bias       bias < 1 时曲线往右推，云「上重下轻」
+//   x      = biased*2 - 1  映射到 [-1, 1]
+//   1 - x²                半圆
+//
+// 结果：hf = 0 和 hf = 1 处都是 0，中间鼓起。
+// bias 默认 0.35 —— 云底比较平、云顶收得圆，接近真实积云的观感。
+//
+// 这一步解决的是上一篇「云是上下一样粗的柱子」的问题。
+// ------------------------------------------------------------
+float shapeAlteringFunction(float heightFraction, float bias) {
+  float biased = pow(heightFraction, bias);
+  float x = clamp(biased * 2.0 - 1.0, -1.0, 1.0);
+  return 1.0 - x * x;
+}
+
+// ------------------------------------------------------------
+// 层内密度剖面。源库用四个系数描述（exp 项 / 指数 / 线性项 / 常数项），
+// 默认退化成线性：0.75 * hf + 0.25
+// ------------------------------------------------------------
+float getLayerDensity(float heightFraction) {
+  return u_profileLinear * heightFraction + u_profileConstant;
+}
+
+// ------------------------------------------------------------
+// 密度场。输入是球坐标系下的位置。
+//
+// 五步，把「均匀一团」一步步雕成云：
+//   ① 高度梯度  —— 底部和顶部密度为 0
+//   ② 覆盖率    —— 决定「有云 / 没云」
+//   ③ 形状噪声  —— Perlin-Worley 3D 纹理，管轮廓
+//   ④ 细节侵蚀  —— 高频 Worley 把边缘啃碎
+//   ⑤ 密度剖面  —— 层内再做一次线性加权
+// ------------------------------------------------------------
+float densityAt(vec3 positionSphere) {
+  float height = length(positionSphere) - (u_bottomRadius + u_minHeight);
+  float hf = clamp(height / (u_maxHeight - u_minHeight), 0.0, 1.0);
+
+  // ① 高度梯度
+  float heightScale = shapeAlteringFunction(hf, u_shapeAlteringBias);
+
+  // ② 覆盖率。源库这里采样天气纹理，本篇先用常数 1.0 代替，
+  //    第 4 篇会把它换成真正的天气图。
+  float factor = 1.0 - u_coverage * heightScale;
+  float base = remapClamped(1.0, factor, factor + u_coverageFilterWidth);
+
+  // ③ 【本篇核心 ②】Perlin-Worley 形状
+  //    shape.bin 是 128³ 的 R8 单通道纹理，采样就是一次三线性插值
+  //    （硬件免费做的，不用自己写）
+  float shape = texture(shapeTexture, positionSphere * u_shapeRepeat).r;
+  float density = remapClamped(base, (1.0 - shape) * u_shapeAmount, 1.0);
+
+  // ④ 细节侵蚀。32³ 的 Worley fbm 纹理。
+  //    顶部用 pow(detail, 6) —— 只有很少的地方能通过，显得蓬松
+  //    底部用 1 - detail     —— 反过来，显得絮状
+  //    中间按 hf 在两者之间插值
+  float detail = texture(shapeDetailTexture, positionSphere * u_shapeDetailRepeat).r;
+  float modifier = mix(pow(detail, 6.0), 1.0 - detail, remapClamped(hf, 0.2, 0.4));
+  modifier = mix(0.0, modifier, u_shapeDetailAmount);
+  density = remapClamped(density * 2.0, modifier * 0.5, 1.0);
+
+  // ⑤ 剖面
+  density *= getLayerDensity(hf);
+
+  return clamp(density * u_densityScale, 0.0, 1.0);
+}
+
+// ============================================================
+// 【本篇新增】光照
+// ============================================================
+
+#define RECIPROCAL_PI4 0.07957747154594767
+
+// 双叶 Henyey-Greenstein 相函数。
+// 前向 g=0.8（光沿原方向继续走）+ 后向 g=-0.2，按 7:3 混合。
+// 前向峰就是「逆光看云边发亮」的来源。
+vec2 henyeyGreenstein(vec2 g, float cosTheta) {
+  vec2 g2 = g * g;
+  return RECIPROCAL_PI4 *
+    ((1.0 - g2) / max(vec2(1e-7), pow(1.0 + g2 - 2.0 * g * cosTheta, vec2(1.5))));
+}
+
+float phaseFunction(float cosTheta, float attenuation) {
+  vec2 g = vec2(0.8, -0.2) * attenuation;
+  vec2 weights = vec2(0.7, 0.3);
+  return dot(henyeyGreenstein(g, cosTheta), weights);
+}
+
+// ① Beer-Lambert：从采样点朝太阳步进，累加光学厚度 τ。
+//    步长指数增长（每步 ×2）—— 近处精细、远处粗略，省算力。
+float marchSunOpticalDepth(vec3 origin, vec3 sunDir) {
+  float opticalDepth = 0.0;
+  float stepSize = u_sunStepSize;
+  float t = stepSize * 0.5;
+
+  for (float i = 0.0; i < 16.0; i += 1.0) {
+    if (i >= u_sunStepCount) break;
+    vec3 p = origin + sunDir * t;
+    opticalDepth += densityAt(p) * u_extinction * stepSize;
+    t += stepSize;
+    stepSize *= u_sunStepScale;
+  }
+  return opticalDepth;
+}
+
+// ② Oz 多重散射近似。
+//    叠若干阶，每阶把「衰减系数」和「相函数各向异性」都减半：
+//      coeffs = [attenuation, contribution, phase attenuation]
+//    物理直觉：光在云里每散射一次，方向就更随机一点、能量就更弱一点。
+//    只做单次散射（octaves = 1）时，厚云会黑掉 —— 因为 exp(-τ) 直接趋零。
+float multiScattering(float opticalDepth, float cosTheta) {
+  vec3 coeffs = vec3(1.0);
+  vec3 attenuation = vec3(0.5, 0.5, 0.5);
+  float scattering = 0.0;
+
+  for (float i = 0.0; i < 16.0; i += 1.0) {
+    if (i >= u_multiScatterOctaves) break;
+    float beerLambert = exp(-opticalDepth * coeffs.y);
+    scattering += coeffs.x * beerLambert * phaseFunction(cosTheta, coeffs.z);
+    coeffs *= attenuation;
+  }
+  return scattering;
+}
+
+void main(void) {
+  vec4 sceneColor = texture(colorTexture, v_textureCoordinates);
+
+  // —— 1. 从像素坐标构造世界空间视线方向 ——
+  vec2 ndc = v_textureCoordinates * 2.0 - 1.0;
+  vec3 rayDirection = normalize(
+    u_cameraDirection +
+    u_cameraRight * (ndc.x * u_tanHalfFov.x) +
+    u_cameraUp    * (ndc.y * u_tanHalfFov.y)
+  );
+
+  // ===== 本篇新增：视线与太阳的夹角余弦，相函数要用 =====
+  float cosTheta = dot(u_sunDirection, rayDirection);
+
+  // ===== 光照调试视图 =====
+  if (u_lightDebug > 0.5 && u_lightDebug < 5.5) {
+    if (u_lightDebug < 1.5) {
+      out_FragColor = vec4(u_sunColor, 1.0);                 // 太阳色
+    } else if (u_lightDebug < 2.5) {
+      out_FragColor = vec4(vec3(cosTheta * 0.5 + 0.5), 1.0); // 视线与太阳夹角
+    } else if (u_lightDebug < 3.5) {
+      out_FragColor = vec4(u_skyColor, 1.0);                 // 天空光色
+    } else if (u_lightDebug < 4.5) {
+      out_FragColor = vec4(vec3(u_exposure / 60.0), 1.0);    // 曝光
+    } else {
+      out_FragColor = vec4(vec3(u_sunDirection * 0.5 + 0.5), 1.0);  // 太阳方向
+    }
+    return;
+  }
+  if (u_lightDebug > 7.5) {
+    // 多 uniform 检查：R=太阳色R  G=天空色B  B=天空光强度/5
+    out_FragColor = vec4(u_sunColor.r, u_skyColor.b, u_skyLightScale / 5.0, 1.0);
+    return;
+  }
+
+  // —— 2. 和云壳求交，拿到进出云层的区间 ——
+  float innerRadius = u_bottomRadius + u_minHeight;
+  float outerRadius = u_bottomRadius + u_maxHeight;
+
+  vec3 origin = u_cameraPositionSphere;
+  float cameraRadius = length(origin);
+
+  vec2 outerHit = raySphereIntersection(origin, rayDirection, outerRadius);
+  // 两个判断缺一不可：
+  //   outerHit.y <= 0  →  交点全在相机背后。相机在球外、视线朝上时就是这种情况，
+  //                       球在身后。只判「有没有实根」是不够的。
+  if (outerHit.y <= 0.0) {
+    out_FragColor = sceneColor;
+    return;
+  }
+
+  vec2 innerHit = raySphereIntersection(origin, rayDirection, innerRadius);
+  bool hitsGround = rayIntersectsGround(origin, rayDirection);
+
+  float tNear;
+  float tFar;
+  if (cameraRadius > outerRadius) {
+    // 相机在云层之上：从穿入外球开始
+    tNear = max(outerHit.x, 0.0);
+    // 如果视线会打到内球，就在那儿结束（穿出云底）；否则到外球背面
+    tFar = innerHit.x > 0.0 ? innerHit.x : outerHit.y;
+  } else if (cameraRadius > innerRadius) {
+    // 相机就在云层里：从眼前开始
+    tNear = 0.0;
+    tFar = innerHit.x > 0.0 ? innerHit.x : outerHit.y;
+  } else {
+    // 相机在云层之下。
+    // 视线朝下时射线会扎进地里 —— 这时看不到云，直接返回原色。
+    // （不返回的话，射线会从地球另一侧穿回云层半径区间，画出「地下的云」）
+    if (hitsGround) {
+      out_FragColor = sceneColor;
+      return;
+    }
+    tNear = max(innerHit.y, 0.0);
+    tFar = outerHit.y;
+  }
+
+  tFar = min(tFar, tNear + u_maxDistance);
+  if (tFar <= tNear) {
+    out_FragColor = sceneColor;
+    return;
+  }
+
+  // —— 3. 等距步进，累加密度 ——
+  float stepLength = (tFar - tNear) / u_stepCount;
+  float transmittance = 1.0;
+  vec3 scattered = vec3(0.0);
+  // ===== 本篇新增：云的前表面距离（沿视线、从相机算起）=====
+  float cloudFrontDepth = -1.0;
+
+  for (float i = 0.0; i < 512.0; i += 1.0) {
+    if (i >= u_stepCount) break;
+
+    float t = tNear + (i + 0.5) * stepLength;
+    vec3 positionSphere = origin + rayDirection * t;
+
+    float density = densityAt(positionSphere);
+    if (density > 0.0) {
+      // 第一次采到密度，就是云的「前表面」
+      if (cloudFrontDepth < 0.0) cloudFrontDepth = t;
+
+      float extinction = density * u_extinction;
+
+      // 层内高度比例，天空环境光要用
+      float hf = clamp(
+        (length(positionSphere) - (u_bottomRadius + u_minHeight)) /
+          (u_maxHeight - u_minHeight),
+        0.0, 1.0
+      );
+
+      if (u_lightingEnabled < 0.5) {
+        // —— 前三篇的做法：不管光照，直接叠加纯白 ——
+        float sampleTransmittance = exp(-extinction * stepLength);
+        scattered += transmittance * (1.0 - sampleTransmittance) * u_cloudColor;
+        transmittance *= sampleTransmittance;
+      } else {
+        // —— 本篇：走完整光照 ——
+
+        // ① Beer-Lambert：朝太阳步进求光学厚度
+        float opticalDepth = marchSunOpticalDepth(positionSphere, u_sunDirection);
+
+        // ② Oz 多重散射（octaves = 1 时退化成单次散射）
+        vec3 radiance = u_sunColor * multiScattering(opticalDepth, cosTheta);
+
+        // 天空环境光：用一个粗糙的高度梯度，云顶比云底亮一点
+        float skyGradient = hf * 0.5 + 0.5;
+        radiance += u_skyColor * RECIPROCAL_PI4 * skyGradient * u_skyLightScale;
+
+        // 乘上散射系数。
+        //
+        // ⚠️ 这里必须是 extinction * albedo，不能是 density * 常数 ——
+        // 后面能量守恒积分要除以 extinction：
+        //     scatteringIntegral = radiance * (1 - T) / extinction
+        // 如果 radiance 用的系数和 extinction 不同量级，就会凭空放大。
+        // 源库里两者都等于密度，所以没这个问题。
+        float scattering = extinction * u_albedo;
+        radiance *= scattering;
+
+        // ③ Beer-Powder：稀疏处压暗，做出「糖霜」暗边。
+        //
+        // ⚠️ 这里用的是**归一化密度** density（0~1），不是 extinction。
+        //    源库里两者恰好相等（extinction = density × 1），写哪个都行；
+        //    本 demo 的 extinction = density × 0.003，小了 333 倍 ——
+        //    要是照抄成 exp(-extinction * 150)，指数几乎恒为 0，
+        //    因子就退化成常数 1 - 0.8 = 0.2，整朵云被无差别压暗 5 倍。
+        radiance *= 1.0 - u_powderScale * exp(-density * u_powderExponent);
+
+        // 能量守恒积分（Frostbite 5.6.3）
+        float sampleTransmittance = exp(-extinction * stepLength);
+        float clampedExtinction = max(extinction, 1e-7);
+        vec3 scatteringIntegral =
+          (radiance - radiance * sampleTransmittance) / clampedExtinction;
+        scattered += transmittance * scatteringIntegral;
+        transmittance *= sampleTransmittance;
+      }
+
+      if (transmittance < 0.01) break;   // 已经不透光了，提前退出
+    }
+  }
+
+  vec3 cloudColor = scattered;
+  float cloudAlpha = 1.0 - transmittance;
+
+  // ===== 本篇新增：场景深度测试 =====
+  bool depthValid = false;
+  float sceneEyeZ = readSceneEyeDepth(v_textureCoordinates, depthValid);
+
+  if (u_debugSceneDepth > 0.5) {
+    // 调试视图：场景深度可视化（近处暗、远处亮、天空纯白）
+    out_FragColor = vec4(vec3(depthValid ? fract(sceneEyeZ * 1e-4) : 1.0), 1.0);
+    return;
+  }
+
+  if (u_depthTestEnabled > 0.5 && depthValid && cloudFrontDepth > 0.0) {
+    // eyeZ 是「沿相机朝向」的深度，换算成「沿这条视线」的距离
+    float sceneAlongRay =
+      sceneEyeZ / max(dot(rayDirection, u_cameraDirection), 1e-5);
+
+    // 软化带：在云前表面附近留一条过渡，避免轮廓出现硬锯齿。
+    // 取距离的 2%，最少 50m。
+    float band = max(50.0, cloudFrontDepth * u_occlusionBandScale);
+    float visible = smoothstep(
+      cloudFrontDepth - band,
+      cloudFrontDepth + band,
+      sceneAlongRay
+    );
+    cloudAlpha *= visible;
+  }
+
+  // ===== 本篇新增：曝光。光照算出来的辐射亮度量级很小（约 0.01~0.05），
+  // 不乘曝光的话云会黑得看不见。真实色调映射留到第 8 篇。 =====
+  if (u_lightingEnabled > 0.5) {
+    cloudColor *= u_exposure;
+  }
+
+  // ===== 调试：直接看云的最终颜色 =====
+  if (u_lightDebug > 5.5 && u_lightDebug < 6.5) {
+    out_FragColor = vec4(scattered, 1.0);          // 曝光前的累积辐射
+    return;
+  }
+  if (u_lightDebug > 6.5 && u_lightDebug < 7.5) {
+    out_FragColor = vec4(cloudColor, 1.0);         // 曝光后的颜色
+    return;
+  }
+
+  out_FragColor = vec4(mix(sceneColor.rgb, cloudColor, cloudAlpha), sceneColor.a);
+}
+`;
+
+      createApp({
+        data() {
+          return {
+            viewer: null,
+            imageryLayer: null,
+            cloudStage: null,
+            tileset: null,
+            statusText: "",
+            scratch: {},
+            // ===== 本篇新增：两张预计算的 3D 噪声纹理 =====
+            volumeTextures: { shape: null, shapeDetail: null },
+            params: {
+              // 云层
+              baseHeight: 1200,
+              thickness: 1800,
+              densityScale: 1.0,
+              coverage: 0.22,
+              cloudColor: "#ffffff",
+              // 步进
+              stepCount: 64,
+              maxDistance: 40000,
+              // ===== 本篇新增：形状 =====
+              shapeAmount: 1.0,
+              shapeRepeat: 0.00003,
+              shapeDetailAmount: 0.35,
+              shapeDetailRepeat: 0.003,
+              shapeAlteringBias: 0.35,
+              profileLinear: 0.75,
+              profileConstant: 0.25,
+              // ===== 本篇新增：场景遮挡 =====
+              depthTest: true,
+              occlusionBandScale: 0.02,
+              debugSceneDepth: false,
+              // ===== 本篇新增：光照 =====
+              lightingEnabled: true,
+              sunColor: "#fff7e8",
+              skyColor: "#dbeeff",
+              skyLightScale: 1.0,
+              extinction: 0.003,
+              albedo: 1.0,
+              powderScale: 0.8,
+              powderExponent: 150,
+              multiScatterOctaves: 8,
+              exposure: 7,
+              sunStepCount: 6,
+              sunStepSize: 40,
+              sunStepScale: 2.0,
+              lightDebug: 0,
+              timePreset: "正午 12:00",
+            },
+          };
+        },
+        async mounted() {
+          this.initMap();
+          this.loadTileset();
+          // ===== 本篇新增：3D 噪声纹理必须先就绪，再挂后处理 =====
+          await this.loadNoiseTextures();
+          this.addClouds();
+          this.addlilgui();
+        },
+        beforeUnmount() {
+          if (this.myLilGui) {
+            this.myLilGui.destroy();
+            this.myLilGui = null;
+          }
+        },
+        methods: {
+          initMap() {
+            // ===== 本篇新增：固定起始时间 =====
+            // 不指定的话，页面在夜里打开就是一片黑云。
+            // 而且 viewer 会在构造后用自己的 clock 覆盖 currentTime，
+            // 所以必须**在构造时**就把 clockViewModel 传进去。
+            const startTime = Cesium.JulianDate.fromIso8601("2026-06-21T04:00:00Z");
+            const clock = new Cesium.Clock({
+              currentTime: Cesium.JulianDate.clone(startTime),
+              startTime: Cesium.JulianDate.addDays(startTime, -1, new Cesium.JulianDate()),
+              stopTime: Cesium.JulianDate.addDays(startTime, 1, new Cesium.JulianDate()),
+              clockRange: Cesium.ClockRange.LOOP_STOP,
+              shouldAnimate: true,
+              multiplier: 20,
+            });
+
+            let viewer = new Cesium.Viewer("cesiumContainer", {
+              // ===== 本篇新增：时间轴 =====
+              // 光照完全由太阳方向决定，所以「时间」本身就是这个 demo 的一个参数。
+              // 打开时间轴，读者才能亲手把太阳拖到不同位置看云的明暗变化。
+              // （前 3 篇没有光照，时间无关，所以不开。）
+              //
+              // ⚠️ 只改这两行的值，不要再往上加一份 timeline/animation ——
+              // 对象字面量里重复的 key 是**后者覆盖前者**，
+              // 上面写了 true、下面还留着 false 的话，等于没开。
+              clockViewModel: new Cesium.ClockViewModel(clock),
+              baseLayer: false,
+              animation: true,
+              timeline: true,
+              fullscreenButton: false,
+              infoBox: false,
+              geocoder: false,
+              homeButton: false,
+              sceneModePicker: false,
+              baseLayerPicker: false,
+              navigationHelpButton: false,
+              selectionIndicator: false,
+              shouldAnimate: true,
+            });
+
+            window.viewer = viewer;
+            // viewer.scene.debugShowFramesPerSecond = true;
+            viewer.scene.globe.enableLighting = false;
+            viewer.scene.fog.enabled = false;
+            viewer.scene.skyAtmosphere.show = true;
+            viewer._cesiumWidget._creditContainer.style.display = "none";
+
+            let imageryLayer = viewer.imageryLayers.addImageryProvider(
+              new Cesium.UrlTemplateImageryProvider({
+                url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                maximumLevel: 18,
+              }),
+            );
+
+            this.viewer = viewer;
+            this.imageryLayer = imageryLayer;
+
+            // 相机放在云层之上，略微俯视 —— 能同时看到云顶和地平线
+            viewer.camera.setView({
+              destination: Cesium.Cartesian3.fromDegrees(116.4, 39.9, 7000),
+              orientation: {
+                heading: Cesium.Math.toRadians(0),
+                pitch: Cesium.Math.toRadians(-17),
+                roll: 0,
+              },
+            });
+            return viewer;
+          },
+          async loadTileset() {
+            try {
+              this.statusText = "正在加载 3D Tiles 白模…";
+              this.tileset = await Cesium.Cesium3DTileset.fromUrl(
+                "../data/tileset/baimo/tileset.json",
+                {
+                  maximumScreenSpaceError: 16,
+                  maximumMemoryUsage: 2048,
+                },
+              );
+              this.viewer.scene.primitives.add(this.tileset);
+              await this.viewer.zoomTo(this.tileset);
+              this.statusText = "模型加载完成。";
+            } catch (error) {
+              console.warn("3D Tiles 加载失败：", error);
+              this.statusText = `3D Tiles 加载失败：${error.message}`;
+            }
+          },
+
+          /**
+           * 每帧算一次「云壳球心」。
+           *
+           * 这个球要满足：半径固定为 BOTTOM_RADIUS，且与椭球在**相机的地面投影点**
+           * 处相切。所以球心 = 地面点 - 法线 * BOTTOM_RADIUS。
+           *
+           * 直观理解：球心会落在离地心很近的地方，整个球几乎是「以地心为球心、
+           * 半径 6360km」的一个球，只是沿法线挪了一点，好让球面正好压在地面点上。
+           * 这样云层高度就永远相对「脚下的地面」来算。
+           */
+          computeSphereCenter() {
+            const s = this.scratch;
+            const ellipsoid = this.viewer.scene.globe.ellipsoid;
+            const cameraPosition = this.viewer.camera.positionWC;
+
+            if (!s.carto) s.carto = new Cesium.Cartographic();
+            if (!s.surface) s.surface = new Cesium.Cartesian3();
+            if (!s.normal) s.normal = new Cesium.Cartesian3();
+            if (!s.center) s.center = new Cesium.Cartesian3();
+
+            const carto = Cesium.Cartographic.fromCartesian(
+              cameraPosition,
+              ellipsoid,
+              s.carto,
+            );
+            carto.height = 0;
+            const surface = Cesium.Cartographic.toCartesian(
+              carto,
+              ellipsoid,
+              s.surface,
+            );
+            const normal = ellipsoid.geodeticSurfaceNormal(surface, s.normal);
+
+            const center = Cesium.Cartesian3.multiplyByScalar(
+              normal,
+              BOTTOM_RADIUS,
+              s.center,
+            );
+            Cesium.Cartesian3.subtract(surface, center, center);
+
+            // 相对相机的位置（球坐标系里的相机位置 = 球心 - 相机位置 取反）
+            const centerRelative = Cesium.Cartesian3.subtract(
+              center,
+              cameraPosition,
+              s.centerRelative || (s.centerRelative = new Cesium.Cartesian3()),
+            );
+            return Cesium.Cartesian3.negate(
+              centerRelative,
+              s.cameraPositionSphere ||
+                (s.cameraPositionSphere = new Cesium.Cartesian3()),
+            );
+          },
+
+          /**
+           * ===== 本篇新增 =====
+           * 求「指向太阳」的单位向量（ECEF）。
+           *
+           * 先用 Simon1994 算出太阳在**惯性系**里的位置，
+           * 再用 computeIcrfToFixedMatrix 转到**地固系**。
+           *
+           * 云壳坐标系只是把地固系平移了一下，方向不变，
+           * 所以这个向量可以直接拿到着色器里用。
+           */
+          /**
+           * ===== 本篇新增 =====
+           * 跳到指定时间。
+           *
+           * 注意用 clockViewModel 而不是 viewer.clock ——
+           * viewer 的 clock 是受 view model 驱动的，直接改会被覆盖回去。
+           */
+          setTime(iso) {
+            if (!this.viewer) return;
+            this.viewer.clockViewModel.currentTime =
+              Cesium.JulianDate.fromIso8601(iso);
+          },
+
+          /** 把 #rrggbb 转成 vec3（0~1），给 vec3 uniform 用 */
+          hexToVec3(hex) {
+            const c = Cesium.Color.fromCssColorString(hex);
+            if (!this._vec3Cache) this._vec3Cache = {};
+            const k = hex;
+            if (!this._vec3Cache[k]) this._vec3Cache[k] = new Cesium.Cartesian3();
+            this._vec3Cache[k].x = c.red;
+            this._vec3Cache[k].y = c.green;
+            this._vec3Cache[k].z = c.blue;
+            return this._vec3Cache[k];
+          },
+
+          computeSunDirection() {
+            const s = this.scratch;
+            if (!s.sunPos) s.sunPos = new Cesium.Cartesian3();
+            if (!s.icrf) s.icrf = new Cesium.Matrix3();
+
+            const time = this.viewer.clock.currentTime;
+            Cesium.Simon1994PlanetaryPositions.computeSunPositionInEarthInertialFrame(
+              time, s.sunPos,
+            );
+            const m = Cesium.Transforms.computeIcrfToFixedMatrix(time, s.icrf);
+            if (Cesium.defined(m)) {
+              Cesium.Matrix3.multiplyByVector(m, s.sunPos, s.sunPos);
+            }
+            return Cesium.Cartesian3.normalize(s.sunPos, s.sunPos);
+          },
+
+          /**
+           * ===== 本篇新增 =====
+           * 加载预计算的 3D 噪声纹理。
+           *
+           * 两个 .bin 都是**裸 R8 数据**，没有文件头：
+           *   shape.bin        128³ = 2,097,152 字节
+           *   shape_detail.bin  32³ =    32,768 字节
+           *
+           * 用 Cesium.Texture3D 上传，着色器里用 sampler3D 采样，
+           * 三线性插值由硬件做。wrapS/T/R 全设 REPEAT，噪声才能无限平铺。
+           */
+          async loadVolumeTexture(url, size) {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`${url} 加载失败：HTTP ${res.status}`);
+            const data = new Uint8Array(await res.arrayBuffer());
+            const expected = size * size * size;
+            if (data.length !== expected) {
+              throw new Error(`${url} 大小不对：期望 ${expected}，实际 ${data.length}`);
+            }
+            return new Cesium.Texture3D({
+              context: this.viewer.scene.context,
+              width: size,
+              height: size,
+              depth: size,
+              pixelFormat: Cesium.PixelFormat.RED,
+              pixelDatatype: Cesium.PixelDatatype.UNSIGNED_BYTE,
+              flipY: false,
+              sampler: new Cesium.Sampler({
+                minificationFilter: Cesium.TextureMinificationFilter.LINEAR,
+                magnificationFilter: Cesium.TextureMagnificationFilter.LINEAR,
+                wrapS: Cesium.TextureWrap.REPEAT,
+                wrapT: Cesium.TextureWrap.REPEAT,
+                wrapR: Cesium.TextureWrap.REPEAT,
+              }),
+              source: { width: size, height: size, depth: size, arrayBufferView: data },
+            });
+          },
+
+          async loadNoiseTextures() {
+            try {
+              const [shape, shapeDetail] = await Promise.all([
+                this.loadVolumeTexture("./data/clouds/shape.bin", 128),
+                this.loadVolumeTexture("./data/clouds/shape_detail.bin", 32),
+              ]);
+              this.volumeTextures.shape = shape;
+              this.volumeTextures.shapeDetail = shapeDetail;
+              console.log("[体积云02] 噪声纹理就绪", {
+                shape: shape.width + "³",
+                shapeDetail: shapeDetail.width + "³",
+              });
+            } catch (e) {
+              console.error("[体积云02] 噪声纹理加载失败：", e);
+            }
+          },
+
+          addClouds() {
+            const viewer = this.viewer;
+            const p = this.params;
+
+            this.cloudStage = new Cesium.PostProcessStage({
+              name: "volumetricClouds01",
+              fragmentShader: CLOUD_SHADER,
+              uniforms: {
+                // 相机在球坐标系里的位置
+                u_cameraPositionSphere: () => this.computeSphereCenter(),
+                u_cameraDirection: () => viewer.camera.directionWC,
+                u_cameraRight: () => viewer.camera.rightWC,
+                u_cameraUp: () => viewer.camera.upWC,
+                u_tanHalfFov: () => {
+                  const fovy = viewer.camera.frustum.fovy;
+                  const aspect = viewer.camera.frustum.aspectRatio;
+                  const tanY = Math.tan(fovy * 0.5);
+                  if (!this._tanHalfFov)
+                    this._tanHalfFov = new Cesium.Cartesian2();
+                  this._tanHalfFov.x = tanY * aspect;
+                  this._tanHalfFov.y = tanY;
+                  return this._tanHalfFov;
+                },
+
+                u_bottomRadius: () => BOTTOM_RADIUS,
+                u_minHeight: () => p.baseHeight,
+                u_maxHeight: () => p.baseHeight + p.thickness,
+
+                u_stepCount: () => p.stepCount,
+                u_maxDistance: () => p.maxDistance,
+
+                u_densityScale: () => p.densityScale,
+                u_coverage: () => p.coverage,
+                u_cloudColor: () =>
+                  Cesium.Color.fromCssColorString(p.cloudColor),
+
+                // ===== 本篇新增：形状噪声 =====
+                shapeTexture: () => this.volumeTextures.shape,
+                shapeDetailTexture: () => this.volumeTextures.shapeDetail,
+                u_shapeRepeat: () => p.shapeRepeat,
+                u_shapeDetailRepeat: () => p.shapeDetailRepeat,
+                u_shapeAmount: () => p.shapeAmount,
+                u_shapeDetailAmount: () => p.shapeDetailAmount,
+                u_shapeAlteringBias: () => p.shapeAlteringBias,
+                u_coverageFilterWidth: () => 0.6,
+                u_profileLinear: () => p.profileLinear,
+                u_profileConstant: () => p.profileConstant,
+
+                // ===== 本篇新增：场景遮挡 =====
+                u_depthTestEnabled: () => (p.depthTest ? 1 : 0),
+                u_occlusionBandScale: () => p.occlusionBandScale,
+                u_debugSceneDepth: () => (p.debugSceneDepth ? 1 : 0),
+
+                // ===== 本篇新增：光照 =====
+                u_lightingEnabled: () => (p.lightingEnabled ? 1 : 0),
+                u_sunDirection: () => this.computeSunDirection(),
+                // 注意：这里显式转成 Cartesian3 而不是直接传 Cesium.Color。
+                // vec3 uniform 传 Color 在某些情况下拿不到值（实测 u_skyColor 会是 0），
+                // 转成 Cartesian3 最稳妥。
+                u_sunColor: () => this.hexToVec3(p.sunColor),
+                u_skyColor: () => this.hexToVec3(p.skyColor),
+                u_skyLightScale: () => p.skyLightScale,
+                u_extinction: () => p.extinction,
+                u_albedo: () => p.albedo,
+                u_powderScale: () => p.powderScale,
+                u_powderExponent: () => p.powderExponent,
+                u_multiScatterOctaves: () => p.multiScatterOctaves,
+                u_exposure: () => p.exposure,
+                u_sunStepCount: () => p.sunStepCount,
+                u_sunStepSize: () => p.sunStepSize,
+                u_sunStepScale: () => p.sunStepScale,
+                u_lightDebug: () => p.lightDebug,
+              },
+            });
+
+            viewer.scene.postProcessStages.add(this.cloudStage);
+          },
+
+          addlilgui() {
+            let myLilGui = new GUI({ title: "体积云 04 · 光照" });
+            this.myLilGui = myLilGui;
+            const p = this.params;
+
+            const cloudFolder = myLilGui.addFolder("云层");
+            cloudFolder.add(p, "baseHeight", 200, 8000, 50).name("云底高度(m)");
+            cloudFolder.add(p, "thickness", 300, 8000, 50).name("云层厚度(m)");
+            cloudFolder.add(p, "densityScale", 0.05, 3, 0.05).name("密度倍率");
+            cloudFolder.add(p, "coverage", 0.05, 0.95, 0.01).name("覆盖率");
+            cloudFolder.addColor(p, "cloudColor").name("云的底色");
+
+            // ===== 本篇新增：形状 =====
+            const shapeFolder = myLilGui.addFolder("形状");
+            shapeFolder
+              .add(p, "shapeAmount", 0, 1, 0.01)
+              .name("形状噪声强度");
+            shapeFolder
+              .add(p, "shapeRepeat", 0.00001, 0.0004, 0.00001)
+              .name("形状纹理密度");
+            shapeFolder
+              .add(p, "shapeDetailAmount", 0, 1, 0.01)
+              .name("细节侵蚀强度");
+            shapeFolder
+              .add(p, "shapeDetailRepeat", 0.001, 0.012, 0.0005)
+              .name("细节纹理密度");
+            shapeFolder
+              .add(p, "shapeAlteringBias", 0.1, 1.5, 0.01)
+              .name("高度梯度偏置");
+
+            // ===== 本篇新增：时间 =====
+            const timeFolder = myLilGui.addFolder("时间");
+            timeFolder
+              .add(p, "timePreset", Object.keys(TIME_PRESETS))
+              .name("跳到")
+              .onChange((v) => this.setTime(TIME_PRESETS[v]));
+            timeFolder
+              .add({ fn: () => this.setTime(TIME_PRESETS["正午 12:00"]) }, "fn")
+              .name("回到正午");
+
+            // ===== 光照 =====
+            const lightFolder = myLilGui.addFolder("光照");
+            lightFolder
+              .add(p, "lightingEnabled")
+              .name("启用光照（关掉=纯白对比）");
+            lightFolder
+              .add(p, "multiScatterOctaves", 1, 12, 1)
+              .name("多重散射阶数（1=单次）");
+            lightFolder
+              .add(p, "powderScale", 0, 1, 0.01)
+              .name("Beer-Powder 强度");
+            lightFolder
+              .add(p, "powderExponent", 1, 400, 1)
+              .name("Beer-Powder 指数");
+            lightFolder
+              .add(p, "exposure", 1, 60, 0.5)
+              .name("曝光");
+            lightFolder
+              .add(p, "lightDebug", {
+                "关": 0, "太阳色": 1, "视线与太阳夹角": 2,
+                "天空光色": 3, "曝光": 4, "太阳方向": 5,
+                "云辐射(曝光前)": 6, "云颜色(曝光后)": 7,
+              })
+              .name("光照调试视图");
+
+            const lightColorFolder = myLilGui.addFolder("光照颜色");
+            lightColorFolder.addColor(p, "sunColor").name("太阳色");
+            lightColorFolder.addColor(p, "skyColor").name("天空光色");
+            lightColorFolder
+              .add(p, "skyLightScale", 0, 5, 0.05)
+              .name("天空光强度");
+
+            const mediaFolder = myLilGui.addFolder("介质");
+            mediaFolder
+              .add(p, "extinction", 0.0005, 0.02, 0.0005)
+              .name("消光系数");
+            mediaFolder
+              .add(p, "albedo", 0, 1, 0.01)
+              .name("单次散射反照率");
+
+            const sunFolder = myLilGui.addFolder("太阳步进");
+            sunFolder
+              .add(p, "sunStepCount", 1, 16, 1)
+              .name("步进次数");
+            sunFolder
+              .add(p, "sunStepSize", 5, 200, 5)
+              .name("初始步长(m)");
+            sunFolder
+              .add(p, "sunStepScale", 1, 3, 0.1)
+              .name("步长增长");
+
+            // ===== 场景遮挡 =====
+            const occlFolder = myLilGui.addFolder("场景遮挡");
+            occlFolder
+              .add(p, "depthTest")
+              .name("启用深度遮挡");
+            occlFolder
+              .add(p, "occlusionBandScale", 0, 0.2, 0.005)
+              .name("软化带比例");
+            occlFolder
+              .add(p, "debugSceneDepth")
+              .name("显示场景深度（调试）");
+
+            const profileFolder = myLilGui.addFolder("密度剖面");
+            profileFolder
+              .add(p, "profileLinear", 0, 2, 0.01)
+              .name("线性项");
+            profileFolder
+              .add(p, "profileConstant", 0, 1, 0.01)
+              .name("常数项");
+
+            const marchFolder = myLilGui.addFolder("步进");
+            marchFolder.add(p, "stepCount", 8, 512, 1).name("采样步数");
+            marchFolder
+              .add(p, "maxDistance", 5000, 300000, 1000)
+              .name("最远步进距离(m)");
+
+            const viewFolder = myLilGui.addFolder("视图");
+            viewFolder
+              .add({ fn: () => this.resetCamera() }, "fn")
+              .name("重置视角");
+
+            const layerFolder = myLilGui.addFolder("图层控制");
+            layerFolder
+              .add(this.imageryLayer, "show")
+              .name("影像图层显示/隐藏");
+            layerFolder
+              .add(this.imageryLayer, "alpha", 0, 1, 0.01)
+              .name("影像图层透明度");
+          },
+
+          resetCamera() {
+            if (!this.viewer) return;
+            this.viewer.camera.setView({
+              destination: Cesium.Cartesian3.fromDegrees(116.4, 39.9, 7000),
+              orientation: {
+                heading: Cesium.Math.toRadians(0),
+                pitch: Cesium.Math.toRadians(-17),
+                roll: 0,
+              },
+            });
+          },
+        },
+      }).mount("#app");
+    </script>
+  </body>
+</html>
