@@ -1,0 +1,3960 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>体积云 08 · 大气散射</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Cesium.js"></script>
+    <link
+      href="https://cdn.jsdelivr.net/npm/cesium@1.140.0/Build/Cesium/Widgets/widgets.css"
+      rel="stylesheet"
+    />
+    <style>
+      html,
+      body,
+      #app,
+      #cesiumContainer {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #000;
+      }
+
+      .lil-gui {
+        top: 10px;
+        left: 10px;
+        z-index: 999;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="cesiumContainer"></div>
+    </div>
+
+    <script type="module">
+      const { createApp } = Vue;
+      import GUI from "https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.esm.js";
+
+      // ============================================================
+      // 体积云 08 · 大气散射
+      //
+      // 到第 7 篇为止，云该有的都有了。但整个画面还是「拼」出来的：
+      // 太阳是个常量色、天空环境光是个常量色、远处的云和近处的云一样清楚。
+      // 没有大气。
+      //
+      // 最明显的一处：把时间拖到黄昏，太阳高度角只剩 7°，
+      // 可天空还是蓝的、云也没变暖 —— 因为压根没有大气散射这回事。
+      //
+      // 这一篇引入 Bruneton 预计算大气散射。
+      //
+      //   ① 太阳染色（transmittance LUT）
+      //      阳光斜着穿过大气时，蓝光被散射掉得更多，
+      //      剩下的就偏红 —— 日出日落整片云变橙就是它。
+      //
+      //   ② 天空辐照度（irradiance LUT）
+      //      云的环境光不是凭空来的，是「整个天空的散射光积分」。
+      //      它随高度和太阳高度角变化。
+      //
+      //   ③ 空气透视（scattering LUT）
+      //      相机和云之间也有大气。距离越远，云越被散射光「洗白」，
+      //      地平线附近尤其明显。
+      //
+      //   ④ 光束（light shafts）
+      //      朝太阳方向的那段路径，如果被云挡住，散射就少一段。
+      //      云缝里透出来的光柱就是这么来的。
+      //
+      // 参考实现：cesium-volumetric-clouds（MIT）/ Bruneton & Neyret（INRIA, BSD-3）
+      //
+      // ------------------------------------------------------------
+      // 与源库对齐时修掉的四处（LUT 采样函数本来就逐字一致，
+      // 差的是「怎么用 LUT」和「后期怎么处理」）：
+      //
+      //   A. 云收到的太阳辐照度改用**标量**版
+      //      源库给云调的是 GetSunAndSkyScalarIlluminance（无 cos 项）。
+      //      原来误用了余弦加权版、还把 normal 传成径向 —— 黄昏时
+      //      太阳光被多乘一个 mu_s≈0.12，云比源库暗约 8.6 倍。
+      //      改前黄昏云的总环境光是 [0.31, 0.27, 0.34]（偏蓝、发灰），
+      //      改后是 [1.52, 0.95, 0.75]（橙）。这是「黄昏不变暖」的真正原因。
+      //
+      //   B. 天空辐照度同样改标量版：Irradiance × 2π
+      //      原来退化成 × 1.0，比源库弱 2π ≈ 6.28 倍，
+      //      于是靠 skyIrradianceScale = 4 硬补。现在补丁撤掉，scale 回 1.0。
+      //
+      //   C. 空气透视补回「× transmittance」
+      //      源库是 color × T + inscatter × α；原来只加 inscatter、丢了 × T。
+      //      （顺带把「换 in-scatter 色相」那个补丁改成可选开关，默认关。）
+      //
+      //   D. 曝光 + 色调映射从云层 Pass 移到 RESOLVE
+      //      源库在 ResolvePass 里做 ÷α → ×exposure → pow(contrast)
+      //      → PBR Neutral → czm_inverseGamma → ×α。
+      //      云是叠在 Cesium 已经色调映射过的场景色上的，必须用同一条曲线，
+      //      否则高光硬切白、还会和天空留一条接缝。
+      //      实测改后高光溢出像素从 0.83% 降到 0.00%，p99 从 254 降到 237。
+      // ------------------------------------------------------------
+      // ============================================================
+
+      /** 云壳球心处的「基准半径」，源库的取值 */
+      const BOTTOM_RADIUS = 6360000;
+
+      /**
+       * ===== 本篇新增：时间预设 =====
+       * 演示点在 116.4°E，当地时 = UTC + 8。
+       * 日期取夏至（2026-06-21），北纬 39.9° 正午的太阳天顶角 = 16.5°。
+       */
+      const TIME_PRESETS = {
+        "清晨 06:00": "2026-06-20T22:00:00Z",
+        "正午 12:00": "2026-06-21T04:00:00Z",
+        "黄昏 19:00": "2026-06-21T11:00:00Z",
+        "夜晚 22:00": "2026-06-21T14:00:00Z",
+      };
+
+      /**
+       * ===== 本篇新增：Bayer 抖动表 =====
+       *
+       * 4×4 的 Bayer 矩阵，值是 0~15 的一个排列。它的作用是把 16 个抖动
+       * 相位**均匀铺开**：第 k 帧用第 k 个相位，16 帧走完一轮。
+       *
+       * 为什么不用 Math.random()？
+       *   纯随机的话，相邻两帧的抖动可能挨得很近，16 帧下来覆盖不均，
+       *   收敛又慢又不匀。Bayer 是低差异序列 —— 任意连续 4 帧的相位
+       *   都不重合，所以累积起来又快又稳。
+       *
+       * 它同时驱动两件事：
+       *   1. 亚像素抖动 —— 视线在低分辨率像素内部挪一个亚像素位置
+       *   2. 步进相位抖动 —— 第一步从步长的哪个位置开始走
+       */
+      const BAYER4 = [
+        [0, 8, 2, 10],
+        [12, 4, 14, 6],
+        [3, 11, 1, 9],
+        [15, 7, 13, 5],
+      ];
+
+      /** 取第 frame 帧的 Bayer 相位（0~15），16 帧一循环 */
+      function bayerPhase(frame) {
+        const f = ((frame % 16) + 16) % 16;
+        return BAYER4[f >> 2][f & 3];
+      }
+
+      const SHADOW_SHADER = `
+// ============================================================
+// 【本篇新增】阴影 Pass —— Beer 阴影贴图
+//
+// 它不画颜色，只回答一个问题：
+//   「从这个位置朝太阳看过去，中间隔着多少云？」
+//
+// 屏幕横向切成 u_shadowCascadeCount 份，每份是一个级联。
+// 每个纹素存四个数（输出是 8 位纹理，数值范围要挑得讲究）：
+//   r = frontDist / 8192    从云顶平面到第一朵云的距离
+//   g = T_total             整根云柱的透射率 exp(-τ)
+//   b = cloudDist / 8192    云柱里「真的有云」的那段长度
+//   a = 1
+//
+// 为什么不直接存 τ？
+//   τ 能到几十，8 位存下来量化误差 0.25 以上，乘进 exp() 就是肉眼可见的色带。
+//   透射率本身落在 [0,1]，8 位刚好够。
+//
+// ⚠️ 注意：这一遍必须和主画面用**同一个密度场**，
+//    否则云影会和云本身对不上。所以下面的密度场是两遍共用的。
+// ============================================================
+uniform sampler2D colorTexture;
+
+uniform float u_shadowEnabled;
+uniform float u_shadowCascadeCount;
+uniform float u_shadowStepCount;
+uniform float u_shadowMaxDistance;
+uniform float u_shadowMinDensity;
+
+in vec2 v_textureCoordinates;
+
+
+// —— 云壳 ——
+uniform float u_bottomRadius;
+uniform float u_minHeight;     // 云底高度（相对基准半径）
+uniform float u_maxHeight;     // 云顶高度
+
+// —— 步进 ——
+
+// —— 密度 ——
+uniform float u_densityScale;
+uniform float u_coverage;
+
+
+// —— 这两项两个 pass 都要用 ——
+uniform vec3  u_sunDirection;      // 指向太阳的单位向量
+uniform float u_extinction;        // 消光系数
+
+// —— 阴影图集共用的几何 ——
+uniform vec3  u_cascadeSize;        // 三个级联的水平边长（米）
+uniform vec3  u_groundCenterSphere; // 相机正下方的地面点（球坐标系）
+uniform vec3  u_eastDir;
+uniform vec3  u_northDir;
+// ===== 本篇新增：形状噪声 =====
+// 两张预计算的 3D 噪声纹理，都用 WebGL2 的 sampler3D 采样
+uniform highp sampler3D shapeTexture;        // 128³  Perlin-Worley，管轮廓
+uniform highp sampler3D shapeDetailTexture;  // 32³   Worley fbm，管细节
+uniform float u_shapeRepeat;          // 形状纹理的平铺密度
+uniform float u_shapeDetailRepeat;    // 细节纹理的平铺密度
+uniform float u_shapeAmount;          // 形状噪声的影响强度
+uniform float u_shapeDetailAmount;    // 细节侵蚀的强度
+uniform float u_shapeAlteringBias;    // 高度梯度的偏置（越小云越「上重下轻」）
+uniform float u_coverageFilterWidth;  // 覆盖率的过渡宽度
+uniform float u_profileLinear;        // 层内剖面的线性项
+uniform float u_profileConstant;      // 层内剖面的常数项
+
+// ===== 本篇新增：天气与风 =====
+uniform sampler2D localWeatherTexture;   // 2D 天气图，R 通道 = 覆盖度
+uniform sampler2D turbulenceTexture;     // 2D curl noise
+uniform float u_weatherRepeat;           // 天气图平铺次数
+uniform vec2  u_weatherOffset;           // 风的偏移（UV 单位）
+uniform float u_weatherExponent;         // 天气值指数（越大云越少越薄）
+uniform float u_turbulenceRepeat;        // 湍流平铺次数
+uniform float u_turbulenceDisplacement;  // 湍流位移强度（米）
+
+// 风把云「推着走」，但只推天气图是不够的 ——
+// 那样看起来像是一扇窗户从静止的云上面滑过去。
+// 真正要让云动起来，形状噪声和细节噪声也得跟着漂，
+// 而且要漂得比天气图慢一点（视差），云才有体积感。
+uniform vec3 u_shapeOffset;              // 形状纹理的风偏移
+uniform vec3 u_shapeDetailOffset;        // 细节纹理的风偏移（z 恒为 0，但纹理是 3D 的，得给 vec3）
+uniform float u_useWeather;              // 1=用天气图，0=天气恒为 1（回到第 4 篇的样子）
+
+// ------------------------------------------------------------
+// 【本篇新增】立方球 UV。
+//
+// 天气图是一张 2D 图，要贴到球面上。直接按经纬度贴会在两极挤成一团，
+// 所以用「立方球」映射：先把方向向量投到立方体表面，再做一次松弛
+// 让格子大小更均匀。
+//
+// 有接缝，但源库就是这么做的 —— 对云来说看不出来。
+// ------------------------------------------------------------
+vec2 getCubeSphereUv(const vec3 position) {
+  vec3 n = normalize(position);
+  vec3 f = abs(n);
+  vec3 c = n / max(f.x, max(f.y, f.z));
+  vec2 m;
+  if (all(greaterThan(f.yy, f.xz))) {
+    m = c.y > 0.0 ? vec2(-n.x, n.z) : n.xz;
+  } else if (all(greaterThan(f.xx, f.yz))) {
+    m = c.x > 0.0 ? n.yz : vec2(-n.y, n.z);
+  } else {
+    m = c.z > 0.0 ? n.xy : vec2(n.x, -n.y);
+  }
+  vec2 m2 = m * m;
+  float q = dot(m2.xy, vec2(-2.0, 2.0)) - 3.0;
+  float q2 = q * q;
+  vec2 uv;
+  uv.x = sqrt(1.5 + m2.x - m2.y - 0.5 * sqrt(-24.0 * m2.x + q2)) * (m.x > 0.0 ? 1.0 : -1.0);
+  uv.y = sqrt(6.0 / (3.0 - uv.x * uv.x)) * m.y;
+  return uv * 0.5 + 0.5;
+}
+
+// ------------------------------------------------------------
+// 工具：把 x 从 [min1, max1] 重映射到 [0, 1] 并夹紧
+// ------------------------------------------------------------
+float remapClamped(float x, float min1, float max1) {
+  return clamp((x - min1) / (max1 - min1), 0.0, 1.0);
+}
+
+// ------------------------------------------------------------
+// 【本篇核心 ①】半圆变换 —— 高度梯度
+//
+//   biased = hf^bias       bias < 1 时曲线往右推，云「上重下轻」
+//   x      = biased*2 - 1  映射到 [-1, 1]
+//   1 - x²                半圆
+//
+// 结果：hf = 0 和 hf = 1 处都是 0，中间鼓起。
+// bias 默认 0.35 —— 云底比较平、云顶收得圆，接近真实积云的观感。
+//
+// 这一步解决的是上一篇「云是上下一样粗的柱子」的问题。
+// ------------------------------------------------------------
+float shapeAlteringFunction(float heightFraction, float bias) {
+  float biased = pow(heightFraction, bias);
+  float x = clamp(biased * 2.0 - 1.0, -1.0, 1.0);
+  return 1.0 - x * x;
+}
+
+// ------------------------------------------------------------
+// 层内密度剖面。源库用四个系数描述（exp 项 / 指数 / 线性项 / 常数项），
+// 默认退化成线性：0.75 * hf + 0.25
+// ------------------------------------------------------------
+float getLayerDensity(float heightFraction) {
+  return u_profileLinear * heightFraction + u_profileConstant;
+}
+
+// ------------------------------------------------------------
+// 密度场。输入是球坐标系下的位置。
+//
+// 五步，把「均匀一团」一步步雕成云：
+//   ① 高度梯度  —— 底部和顶部密度为 0
+//   ② 覆盖率    —— 决定「有云 / 没云」
+//   ③ 形状噪声  —— Perlin-Worley 3D 纹理，管轮廓
+//   ④ 细节侵蚀  —— 高频 Worley 把边缘啃碎
+//   ⑤ 密度剖面  —— 层内再做一次线性加权
+// ------------------------------------------------------------
+float densityAt(vec3 positionSphere) {
+  float height = length(positionSphere) - (u_bottomRadius + u_minHeight);
+  float hf = clamp(height / (u_maxHeight - u_minHeight), 0.0, 1.0);
+
+  // ① 高度梯度
+  float heightScale = shapeAlteringFunction(hf, u_shapeAlteringBias);
+
+  // ② 【本篇核心 ①】天气纹理
+  //    这张图才是云的「分布图」—— R 通道直接就是覆盖度。
+  //    加上风的偏移，云就飘起来了。
+  //
+  //    u_useWeather = 0 时把天气值换成常数 1，
+  //    等价于第 4 篇的「整个天空均匀铺一层」，方便对比。
+  vec2 uv = getCubeSphereUv(positionSphere);
+  float weatherRaw = texture(localWeatherTexture, uv * u_weatherRepeat + u_weatherOffset).r;
+  float weather = pow(mix(1.0, weatherRaw, u_useWeather), u_weatherExponent);
+
+  // ③ 覆盖率裁剪。天气值越低，能留下的密度越少 ——
+  //    低到一定程度直接归零，这就是「晴空区」的来源
+  float factor = 1.0 - u_coverage * heightScale;
+  float base = remapClamped(
+    mix(weather, 1.0, u_coverageFilterWidth),
+    factor,
+    factor + u_coverageFilterWidth
+  );
+
+  // ④ 【本篇核心 ③】湍流
+  //    用 curl noise 扭曲形状噪声的采样位置。
+  //    只在云的下半部生效（hf < 0.3），上半部保持干净。
+  float turbMask = clamp((0.3 - hf) / 0.3, 0.0, 1.0);
+  vec3 turbulence = u_turbulenceDisplacement
+    * (texture(turbulenceTexture, uv * u_weatherRepeat * u_turbulenceRepeat).rgb * 2.0 - 1.0)
+    * base * turbMask;
+
+  // ⑤ 【本篇核心 ②】风的三个偏移
+  //    ① 天气图的偏移 u_weatherOffset —— 云「有没有」在移动（大尺度）
+  //    ② 形状/细节纹理的偏移 —— 云「本身」在移动（小尺度）
+  //    ③ evolution —— 沿法线方向的位移，让云层自己「翻涌」
+  //
+  //    ③ 的量级 = |天气图偏移| × 2e4。
+  //    |u_weatherOffset| 是 UV 单位（0~1 之间的小数），乘 2e4 换成米，
+  //    所以风速越大、时间越久，云层沿法线翻涌得越厉害。
+  vec3 surfaceNormal = normalize(positionSphere);
+  vec3 evolution = -surfaceNormal * length(u_weatherOffset) * 2.0e4;
+
+  // ⑥ Perlin-Worley 形状（采样位置被风 + 湍流扰动）
+  vec3 shapePosition =
+    (positionSphere + evolution + turbulence) * u_shapeRepeat + u_shapeOffset;
+  float shape = texture(shapeTexture, shapePosition).r;
+  float density = remapClamped(base, (1.0 - shape) * u_shapeAmount, 1.0);
+
+  // ⑦ 细节侵蚀
+  vec3 detailPosition =
+    (positionSphere + turbulence) * u_shapeDetailRepeat + u_shapeDetailOffset;
+  float detail = texture(shapeDetailTexture, detailPosition).r;
+  float modifier = mix(pow(detail, 6.0), 1.0 - detail, remapClamped(hf, 0.2, 0.4));
+  modifier = mix(0.0, modifier, u_shapeDetailAmount);
+  density = remapClamped(density * 2.0, modifier * 0.5, 1.0);
+
+  // ⑧ 剖面
+  density *= getLayerDensity(hf);
+
+  return clamp(density * u_densityScale, 0.0, 1.0);
+}
+
+// ------------------------------------------------------------
+// 射线与球求交。
+// 返回 (近交点, 远交点)；没打中返回 (-1, -1)。
+// 要求 dir 已归一化。
+// 推导：把 |o + t*d| = r 展开成 t² + 2(o·d)t + (o·o - r²) = 0
+//       记 b = o·d，c = o·o - r²，则 t = -b ± sqrt(b² - c)
+// ------------------------------------------------------------
+vec2 raySphereIntersection(vec3 rayOrigin, vec3 rayDirection, float radius) {
+  float b = dot(rayOrigin, rayDirection);
+  float c = dot(rayOrigin, rayOrigin) - radius * radius;
+  float h = b * b - c;
+  if (h < 0.0) {
+    return vec2(-1.0);
+  }
+  h = sqrt(h);
+  return vec2(-b - h, -b + h);
+}
+
+
+void main() {
+  if (u_shadowEnabled < 0.5) {
+    out_FragColor = vec4(1.0, 1.0, 0.0, 0.0);
+    return;
+  }
+
+  // —— 这个像素属于哪个级联、级联内的局部坐标 ——
+  float n = u_shadowCascadeCount;
+  float idxF = floor(v_textureCoordinates.x * n);
+  float idx = min(idxF, n - 1.0);
+  vec2 local = vec2(fract(v_textureCoordinates.x * n), v_textureCoordinates.y);
+
+  float size = idx < 0.5 ? u_cascadeSize.x
+             : (idx < 1.5 ? u_cascadeSize.y : u_cascadeSize.z);
+
+  // —— 这个纹素对应的「云顶平面」上的点 ——
+  // 用球面而不是平面：最远一级能到 128 km，
+  // 这个尺度下平面和球面差出好几公里，不能忽略。
+  vec3 Q = u_groundCenterSphere
+         + u_eastDir  * (local.x - 0.5) * size
+         + u_northDir * (local.y - 0.5) * size;
+  Q = normalize(Q) * (u_bottomRadius + u_maxHeight);
+
+  // —— 沿 -sunDir 从云顶往下走 ——
+  // 走多长取决于太阳有多高：太阳越低，光线在云层里斜得越厉害。
+  // 不按这个缩放的话，日落时整根光线只走得到云层的一小半。
+  float upDotSun = max(dot(normalize(Q), u_sunDirection), 0.06);
+  float rayLength = min((u_maxHeight - u_minHeight) / upDotSun, u_shadowMaxDistance);
+  float stepLen = rayLength / u_shadowStepCount;
+
+  float tau = 0.0;        // 累计光学厚度
+  float cloudDist = 0.0;  // 云柱长度
+  float front = -1.0;     // 到第一朵云的距离
+
+  for (float i = 0.0; i < 256.0; i += 1.0) {
+    if (i >= u_shadowStepCount) break;
+    float t = (i + 0.5) * stepLen;
+    vec3 p = Q - u_sunDirection * t;
+
+    // 已经掉到云层底下了，再往下也没云
+    if (length(p) - u_bottomRadius < u_minHeight) break;
+
+    float d = densityAt(p);
+    if (d > u_shadowMinDensity) {
+      if (front < 0.0) front = t;
+      tau += d * u_extinction * stepLen;
+      cloudDist += stepLen;
+    }
+  }
+
+  out_FragColor = vec4(
+    front < 0.0 ? 1.0 : clamp(front / 8192.0, 0.0, 1.0),
+    exp(-tau),
+    clamp(cloudDist / 8192.0, 0.0, 1.0),
+    1.0
+  );
+}
+`;
+
+const CLOUD_SHADER = `
+uniform sampler2D colorTexture;
+// ===== 本篇新增：场景深度 =====
+// PostProcessStage 会自动绑定这一张 —— 它是**当前帧**的深度，
+// 包含地形、3D Tiles、建筑等所有不透明物体。
+uniform sampler2D depthTexture;
+in vec2 v_textureCoordinates;
+
+// —— 相机 ——（全部在「球坐标系」里：原点 = 云壳球心）
+uniform vec3  u_cameraPositionSphere;
+uniform vec3  u_cameraDirection;
+uniform vec3  u_cameraRight;
+uniform vec3  u_cameraUp;
+uniform vec2  u_tanHalfFov;
+
+// —— 步进 ——（只有主画面用得到，阴影 pass 有自己的一套）
+uniform float u_stepCount;
+uniform float u_maxDistance;
+uniform vec3  u_cloudColor;
+// ===== 本篇新增：场景遮挡 =====
+uniform float u_depthTestEnabled;     // 0 / 1
+uniform float u_occlusionBandScale;   // 软化带宽度（占云前表面距离的比例）
+uniform float u_debugSceneDepth;      // 1 = 把场景深度可视化
+
+// ===== 本篇新增：光照 =====
+uniform float u_lightingEnabled;      // 0 = 退回前三篇的纯白叠加
+uniform vec3  u_sunColor;             // 太阳色（真实大气透射留到第 8 篇）
+uniform vec3  u_skyColor;             // 天空环境光颜色
+uniform float u_skyLightScale;        // 天空光强度
+uniform float u_albedo;               // 单次散射反照率（1 = 纯散射，无吸收）
+uniform float u_powderScale;          // Beer-Powder 强度
+uniform float u_powderExponent;       // Beer-Powder 指数
+uniform float u_multiScatterOctaves;  // Oz 多重散射阶数（1 = 只有单次散射）
+uniform float u_exposure;             // 曝光
+uniform float u_sunStepCount;         // 朝太阳步进的次数
+uniform float u_sunStepSize;          // 朝太阳步进的初始步长
+uniform float u_sunStepScale;         // 步长增长比例
+uniform float u_lightDebug;           // 光照调试视图（0=关）
+
+
+// —— 云壳 ——
+uniform float u_bottomRadius;
+uniform float u_minHeight;     // 云底高度（相对基准半径）
+uniform float u_maxHeight;     // 云顶高度
+
+// —— 步进 ——
+
+// —— 密度 ——
+uniform float u_densityScale;
+uniform float u_coverage;
+
+
+// —— 这两项两个 pass 都要用 ——
+uniform vec3  u_sunDirection;      // 指向太阳的单位向量
+uniform float u_extinction;        // 消光系数
+
+// —— 阴影图集共用的几何 ——
+uniform vec3  u_cascadeSize;        // 三个级联的水平边长（米）
+uniform vec3  u_groundCenterSphere; // 相机正下方的地面点（球坐标系）
+uniform vec3  u_eastDir;
+uniform vec3  u_northDir;
+// ===== 本篇新增：形状噪声 =====
+// 两张预计算的 3D 噪声纹理，都用 WebGL2 的 sampler3D 采样
+uniform highp sampler3D shapeTexture;        // 128³  Perlin-Worley，管轮廓
+uniform highp sampler3D shapeDetailTexture;  // 32³   Worley fbm，管细节
+uniform float u_shapeRepeat;          // 形状纹理的平铺密度
+uniform float u_shapeDetailRepeat;    // 细节纹理的平铺密度
+uniform float u_shapeAmount;          // 形状噪声的影响强度
+uniform float u_shapeDetailAmount;    // 细节侵蚀的强度
+uniform float u_shapeAlteringBias;    // 高度梯度的偏置（越小云越「上重下轻」）
+uniform float u_coverageFilterWidth;  // 覆盖率的过渡宽度
+uniform float u_profileLinear;        // 层内剖面的线性项
+uniform float u_profileConstant;      // 层内剖面的常数项
+
+// ===== 本篇新增：天气与风 =====
+uniform sampler2D localWeatherTexture;   // 2D 天气图，R 通道 = 覆盖度
+uniform sampler2D turbulenceTexture;     // 2D curl noise
+uniform float u_weatherRepeat;           // 天气图平铺次数
+uniform vec2  u_weatherOffset;           // 风的偏移（UV 单位）
+uniform float u_weatherExponent;         // 天气值指数（越大云越少越薄）
+uniform float u_turbulenceRepeat;        // 湍流平铺次数
+uniform float u_turbulenceDisplacement;  // 湍流位移强度（米）
+
+// 风把云「推着走」，但只推天气图是不够的 ——
+// 那样看起来像是一扇窗户从静止的云上面滑过去。
+// 真正要让云动起来，形状噪声和细节噪声也得跟着漂，
+// 而且要漂得比天气图慢一点（视差），云才有体积感。
+uniform vec3 u_shapeOffset;              // 形状纹理的风偏移
+uniform vec3 u_shapeDetailOffset;        // 细节纹理的风偏移（z 恒为 0，但纹理是 3D 的，得给 vec3）
+uniform float u_useWeather;              // 1=用天气图，0=天气恒为 1（回到第 4 篇的样子）
+
+// ------------------------------------------------------------
+// 【本篇新增】立方球 UV。
+//
+// 天气图是一张 2D 图，要贴到球面上。直接按经纬度贴会在两极挤成一团，
+// 所以用「立方球」映射：先把方向向量投到立方体表面，再做一次松弛
+// 让格子大小更均匀。
+//
+// 有接缝，但源库就是这么做的 —— 对云来说看不出来。
+// ------------------------------------------------------------
+vec2 getCubeSphereUv(const vec3 position) {
+  vec3 n = normalize(position);
+  vec3 f = abs(n);
+  vec3 c = n / max(f.x, max(f.y, f.z));
+  vec2 m;
+  if (all(greaterThan(f.yy, f.xz))) {
+    m = c.y > 0.0 ? vec2(-n.x, n.z) : n.xz;
+  } else if (all(greaterThan(f.xx, f.yz))) {
+    m = c.x > 0.0 ? n.yz : vec2(-n.y, n.z);
+  } else {
+    m = c.z > 0.0 ? n.xy : vec2(n.x, -n.y);
+  }
+  vec2 m2 = m * m;
+  float q = dot(m2.xy, vec2(-2.0, 2.0)) - 3.0;
+  float q2 = q * q;
+  vec2 uv;
+  uv.x = sqrt(1.5 + m2.x - m2.y - 0.5 * sqrt(-24.0 * m2.x + q2)) * (m.x > 0.0 ? 1.0 : -1.0);
+  uv.y = sqrt(6.0 / (3.0 - uv.x * uv.x)) * m.y;
+  return uv * 0.5 + 0.5;
+}
+
+// ------------------------------------------------------------
+// 工具：把 x 从 [min1, max1] 重映射到 [0, 1] 并夹紧
+// ------------------------------------------------------------
+float remapClamped(float x, float min1, float max1) {
+  return clamp((x - min1) / (max1 - min1), 0.0, 1.0);
+}
+
+// ------------------------------------------------------------
+// 【本篇核心 ①】半圆变换 —— 高度梯度
+//
+//   biased = hf^bias       bias < 1 时曲线往右推，云「上重下轻」
+//   x      = biased*2 - 1  映射到 [-1, 1]
+//   1 - x²                半圆
+//
+// 结果：hf = 0 和 hf = 1 处都是 0，中间鼓起。
+// bias 默认 0.35 —— 云底比较平、云顶收得圆，接近真实积云的观感。
+//
+// 这一步解决的是上一篇「云是上下一样粗的柱子」的问题。
+// ------------------------------------------------------------
+float shapeAlteringFunction(float heightFraction, float bias) {
+  float biased = pow(heightFraction, bias);
+  float x = clamp(biased * 2.0 - 1.0, -1.0, 1.0);
+  return 1.0 - x * x;
+}
+
+// ------------------------------------------------------------
+// 层内密度剖面。源库用四个系数描述（exp 项 / 指数 / 线性项 / 常数项），
+// 默认退化成线性：0.75 * hf + 0.25
+// ------------------------------------------------------------
+float getLayerDensity(float heightFraction) {
+  return u_profileLinear * heightFraction + u_profileConstant;
+}
+
+// ------------------------------------------------------------
+// 密度场。输入是球坐标系下的位置。
+//
+// 五步，把「均匀一团」一步步雕成云：
+//   ① 高度梯度  —— 底部和顶部密度为 0
+//   ② 覆盖率    —— 决定「有云 / 没云」
+//   ③ 形状噪声  —— Perlin-Worley 3D 纹理，管轮廓
+//   ④ 细节侵蚀  —— 高频 Worley 把边缘啃碎
+//   ⑤ 密度剖面  —— 层内再做一次线性加权
+// ------------------------------------------------------------
+float densityAt(vec3 positionSphere) {
+  float height = length(positionSphere) - (u_bottomRadius + u_minHeight);
+  float hf = clamp(height / (u_maxHeight - u_minHeight), 0.0, 1.0);
+
+  // ① 高度梯度
+  float heightScale = shapeAlteringFunction(hf, u_shapeAlteringBias);
+
+  // ② 【本篇核心 ①】天气纹理
+  //    这张图才是云的「分布图」—— R 通道直接就是覆盖度。
+  //    加上风的偏移，云就飘起来了。
+  //
+  //    u_useWeather = 0 时把天气值换成常数 1，
+  //    等价于第 4 篇的「整个天空均匀铺一层」，方便对比。
+  vec2 uv = getCubeSphereUv(positionSphere);
+  float weatherRaw = texture(localWeatherTexture, uv * u_weatherRepeat + u_weatherOffset).r;
+  float weather = pow(mix(1.0, weatherRaw, u_useWeather), u_weatherExponent);
+
+  // ③ 覆盖率裁剪。天气值越低，能留下的密度越少 ——
+  //    低到一定程度直接归零，这就是「晴空区」的来源
+  float factor = 1.0 - u_coverage * heightScale;
+  float base = remapClamped(
+    mix(weather, 1.0, u_coverageFilterWidth),
+    factor,
+    factor + u_coverageFilterWidth
+  );
+
+  // ④ 【本篇核心 ③】湍流
+  //    用 curl noise 扭曲形状噪声的采样位置。
+  //    只在云的下半部生效（hf < 0.3），上半部保持干净。
+  float turbMask = clamp((0.3 - hf) / 0.3, 0.0, 1.0);
+  vec3 turbulence = u_turbulenceDisplacement
+    * (texture(turbulenceTexture, uv * u_weatherRepeat * u_turbulenceRepeat).rgb * 2.0 - 1.0)
+    * base * turbMask;
+
+  // ⑤ 【本篇核心 ②】风的三个偏移
+  //    ① 天气图的偏移 u_weatherOffset —— 云「有没有」在移动（大尺度）
+  //    ② 形状/细节纹理的偏移 —— 云「本身」在移动（小尺度）
+  //    ③ evolution —— 沿法线方向的位移，让云层自己「翻涌」
+  //
+  //    ③ 的量级 = |天气图偏移| × 2e4。
+  //    |u_weatherOffset| 是 UV 单位（0~1 之间的小数），乘 2e4 换成米，
+  //    所以风速越大、时间越久，云层沿法线翻涌得越厉害。
+  vec3 surfaceNormal = normalize(positionSphere);
+  vec3 evolution = -surfaceNormal * length(u_weatherOffset) * 2.0e4;
+
+  // ⑥ Perlin-Worley 形状（采样位置被风 + 湍流扰动）
+  vec3 shapePosition =
+    (positionSphere + evolution + turbulence) * u_shapeRepeat + u_shapeOffset;
+  float shape = texture(shapeTexture, shapePosition).r;
+  float density = remapClamped(base, (1.0 - shape) * u_shapeAmount, 1.0);
+
+  // ⑦ 细节侵蚀
+  vec3 detailPosition =
+    (positionSphere + turbulence) * u_shapeDetailRepeat + u_shapeDetailOffset;
+  float detail = texture(shapeDetailTexture, detailPosition).r;
+  float modifier = mix(pow(detail, 6.0), 1.0 - detail, remapClamped(hf, 0.2, 0.4));
+  modifier = mix(0.0, modifier, u_shapeDetailAmount);
+  density = remapClamped(density * 2.0, modifier * 0.5, 1.0);
+
+  // ⑧ 剖面
+  density *= getLayerDensity(hf);
+
+  return clamp(density * u_densityScale, 0.0, 1.0);
+}
+
+// ------------------------------------------------------------
+// 射线与球求交。
+// 返回 (近交点, 远交点)；没打中返回 (-1, -1)。
+// 要求 dir 已归一化。
+// 推导：把 |o + t*d| = r 展开成 t² + 2(o·d)t + (o·o - r²) = 0
+//       记 b = o·d，c = o·o - r²，则 t = -b ± sqrt(b² - c)
+// ------------------------------------------------------------
+vec2 raySphereIntersection(vec3 rayOrigin, vec3 rayDirection, float radius) {
+  float b = dot(rayOrigin, rayDirection);
+  float c = dot(rayOrigin, rayOrigin) - radius * radius;
+  float h = b * b - c;
+  if (h < 0.0) {
+    return vec2(-1.0);
+  }
+  h = sqrt(h);
+  return vec2(-b - h, -b + h);
+}
+
+
+// ============================================================
+// 【本篇新增】阴影图的读取端
+// ============================================================
+uniform sampler2D shadowBuffer;       // 阴影图集
+// ===== 本篇新增：抖动 =====
+uniform vec2 u_jitter;                // 亚像素抖动（UV 偏移）
+uniform float u_stepJitter;           // 步进相位（Bayer，0~1）
+uniform sampler3D stbnTexture;        // 时空蓝噪声 128×128×64，Z = 时间切片
+// ===== 本篇新增：大气 LUT =====
+uniform sampler2D transmittanceTexture;      // 透射率 256×64
+uniform sampler2D irradianceTexture;         // 辐照度 64×16
+uniform sampler3D scatteringTexture;         // 散射 256×128×32
+uniform sampler3D higherOrderScatteringTexture;  // 高阶散射（同一尺寸）
+uniform float u_atmosphereEnabled;
+uniform float u_skyIrradianceScale;
+uniform float u_sunIrradianceScale;
+uniform float u_aerialPerspective;
+uniform float u_lightShafts;
+uniform float u_aerialScale;
+uniform float u_inscatterHueFix;      // 1 = 用太阳透射率换 in-scatter 色相（源库不做）
+uniform float u_atmoDebug;
+uniform float u_stbnFrame;            // 当前帧号，决定取哪个 Z 切片
+uniform float u_useSTBN;              // 1 = 用 STBN，0 = 退回 Bayer 相位
+uniform float u_shadowsEnabled;
+uniform float u_shadowCascadeCount;
+uniform float u_shadowTexelSize;      // 图集里一个纹素的 UV 宽度
+uniform float u_shadowIntensity;      // 云影强度（拖到 0 就是关掉，方便对比）
+uniform float u_shadowBlur;           // PCF 采样半径（纹素）
+uniform float u_castShadowOnScene;    // 是否把云影投到地面
+uniform float u_shadowOnSceneIntensity;
+uniform float u_shadowDebug;
+
+vec4 readShadowTile(vec2 tileUv, float cascadeIndex) {
+  vec2 uv = vec2(
+    (clamp(tileUv.x, 0.0, 1.0) + cascadeIndex) / u_shadowCascadeCount,
+    clamp(tileUv.y, 0.0, 1.0)
+  );
+  return texture(shadowBuffer, uv);
+}
+
+// 给定云层里的一个点 p，返回它朝太阳方向看到多少光。
+//
+// 思路：
+//   ① 沿太阳方向把 p 投影到云顶平面，得到阴影图上的位置
+//   ② 从阴影图读出「整根云柱的透射率」和「云柱有多长」
+//   ③ 只算 p 上面那一截：
+//        frac = (p 到云前表面的距离) / 云柱长度
+//        T = T_total ^ frac
+//      p 在云顶之上 → frac = 0 → T = 1（完全晒得到太阳）
+//      p 在云底 → frac = 1 → T = T_total
+// ------------------------------------------------------------
+float shadowTransmittance(vec3 p, out bool valid) {
+  valid = false;
+  if (u_shadowsEnabled < 0.5) return 1.0;
+
+  vec3 up = normalize(p);
+  float alt = length(p) - u_bottomRadius;
+  float upDotSun = dot(up, u_sunDirection);
+  if (upDotSun < 1e-3) return 1.0;            // 太阳已经在地平线下
+
+  // ① 投影到云顶平面
+  float dTop = (u_maxHeight - alt) / upDotSun;
+  if (dTop < 0.0) return 1.0;                 // 已经在云顶之上
+
+  vec3 Q = p + u_sunDirection * dTop;
+
+  // 落到「相机正下方」那个局部地面坐标系里
+  vec3 rel = Q - u_groundCenterSphere;
+  vec2 planar = vec2(dot(rel, u_eastDir), dot(rel, u_northDir));
+  float distH = length(planar);
+
+  // ② 选级联：第一个能覆盖住这个距离的
+  float cascadeIndex = 2.0;
+  float size = u_cascadeSize.z;
+  if (distH < u_cascadeSize.x * 0.5) {
+    cascadeIndex = 0.0; size = u_cascadeSize.x;
+  } else if (distH < u_cascadeSize.y * 0.5) {
+    cascadeIndex = 1.0; size = u_cascadeSize.y;
+  }
+  if (distH >= size * 0.5) return 1.0;        // 超出最远一级
+
+  vec2 tileUv = planar / size + 0.5;
+  valid = true;
+
+  // ③ PCF：4 个绕圈的采样点。单点采样在云的边缘会有明显的阶梯。
+  float r = u_shadowBlur * u_shadowTexelSize * size;
+  float T = 0.0;
+  for (float i = 0.0; i < 4.0; i += 1.0) {
+    float a = (i + 0.5) * 1.5707963;
+    vec2 off = vec2(cos(a), sin(a)) * r / size;
+    vec4 sh = readShadowTile(tileUv + off, cascadeIndex);
+    float frontDist = sh.r * 8192.0;
+    float cloudDist = max(sh.b * 8192.0, 1.0);
+    float dToFront = max(0.0, dTop - frontDist);
+    float frac = clamp(dToFront / cloudDist, 0.0, 1.0);
+    T += pow(sh.g, frac);
+  }
+  T *= 0.25;
+
+  return mix(1.0, T, u_shadowIntensity);
+}
+
+// ------------------------------------------------------------
+// 把「这块地面收到的云影」乘进颜色里。
+//
+// 地面位置用**射线 × 地面球解析求交**，不从深度纹理还原 —— 两个原因：
+//   ① 俯视时深度值会饱和到 1.0，被 readSceneEyeDepth 判成「天空」，
+//      整条阴影路径静默失效（打开深度调试视图会看到整屏纯白）；
+//   ② 深度给的是**场景表面**（含楼顶、地形起伏），拿它算阴影，
+//      影子会随视角漂移 —— 可太阳在 1.5 亿公里外，
+//      转个视角根本不该让地面的影子挪位置。
+//
+// 单独抽成函数，是因为有两个地方要用：正常路径，以及
+// 「相机在云层之下、视线扎进地面」那条早退分支（低空飞行时最常走）。
+// ------------------------------------------------------------
+void applyGroundShadow(inout vec3 color, vec3 rayOrigin, vec3 rayDir) {
+  if (u_shadowsEnabled < 0.5 || u_castShadowOnScene < 0.5) return;
+  vec2 gh = raySphereIntersection(rayOrigin, rayDir, u_bottomRadius);
+  if (gh.x <= 0.0) return;                    // 这条视线没打到地面
+  bool ok = false;
+  float T = shadowTransmittance(rayOrigin + rayDir * gh.x, ok);
+  if (ok) color *= mix(1.0, T, u_shadowOnSceneIntensity);
+}
+// 注意：out_FragColor 由 Cesium 的 PostProcessStage 自动声明，
+// 这里再写一遍会报 'out_FragColor' : redefinition。
+
+// ------------------------------------------------------------
+// 射线是否打中地球（球心在原点，地面半径 = u_bottomRadius）。
+// 不做这个判断的话，相机在云层之下、视线朝下时，射线会穿过地球、
+// 从**另一侧**再次进入云层所在的半径区间 —— 结果就是「地面以下有云」。
+// ------------------------------------------------------------
+bool rayIntersectsGround(vec3 rayOrigin, vec3 rayDirection) {
+  float r = length(rayOrigin);
+  float mu = dot(rayOrigin, rayDirection) / r;
+  return mu < 0.0 && r * r * (mu * mu - 1.0) + u_bottomRadius * u_bottomRadius >= 0.0;
+}
+
+// ------------------------------------------------------------
+// 【本篇核心】从深度纹理还原场景表面的视空间深度。
+//
+// 两个要点：
+//   1. 深度值要**直接读 .r**，不要 czm_unpackDepth ——
+//      PostProcessStage 绑的是场景原始的深度模板纹理，
+//      不是 Cesium 内部那种打包成 RGBA 的格式。
+//   2. 用 czm_windowToEyeCoordinates 还原，它会自动处理
+//      对数深度 / 线性深度两种情况，不用自己判断。
+//
+// 天空区域没有场景几何，深度接近 1.0，判为无效。
+// 不排除它的话，整片天空都会被当成「被遮挡」。
+// ------------------------------------------------------------
+float readSceneEyeDepth(vec2 uv, out bool valid) {
+  float depthOrLogDepth = texture(depthTexture, uv).r;
+  valid = depthOrLogDepth > 1e-7 && depthOrLogDepth < 1.0 - 1e-7;
+  if (!valid) {
+    return 0.0;
+  }
+  vec4 positionEC = czm_windowToEyeCoordinates(gl_FragCoord.xy, depthOrLogDepth);
+  float eyeDepth = -positionEC.z / positionEC.w;
+  valid = eyeDepth > 0.0 && eyeDepth == eyeDepth;   // 最后一项排除 NaN
+  return valid ? eyeDepth : 0.0;
+}
+
+// ============================================================
+// 【本篇新增】光照
+// ============================================================
+
+#define RECIPROCAL_PI4 0.07957747154594767
+
+// 双叶 Henyey-Greenstein 相函数。
+// 前向 g=0.8（光沿原方向继续走）+ 后向 g=-0.2，按 7:3 混合。
+// 前向峰就是「逆光看云边发亮」的来源。
+vec2 henyeyGreenstein(vec2 g, float cosTheta) {
+  vec2 g2 = g * g;
+  return RECIPROCAL_PI4 *
+    ((1.0 - g2) / max(vec2(1e-7), pow(1.0 + g2 - 2.0 * g * cosTheta, vec2(1.5))));
+}
+
+float phaseFunction(float cosTheta, float attenuation) {
+  vec2 g = vec2(0.8, -0.2) * attenuation;
+  vec2 weights = vec2(0.7, 0.3);
+  return dot(henyeyGreenstein(g, cosTheta), weights);
+}
+
+// ① Beer-Lambert：从采样点朝太阳步进，累加光学厚度 τ。
+//    步长指数增长（每步 ×2）—— 近处精细、远处粗略，省算力。
+float marchSunOpticalDepth(vec3 origin, vec3 sunDir) {
+  float opticalDepth = 0.0;
+  float stepSize = u_sunStepSize;
+  float t = stepSize * 0.5;
+
+  for (float i = 0.0; i < 16.0; i += 1.0) {
+    if (i >= u_sunStepCount) break;
+    vec3 p = origin + sunDir * t;
+    opticalDepth += densityAt(p) * u_extinction * stepSize;
+    t += stepSize;
+    stepSize *= u_sunStepScale;
+  }
+  return opticalDepth;
+}
+
+// ② Oz 多重散射近似。
+//    叠若干阶，每阶把「衰减系数」和「相函数各向异性」都减半：
+//      coeffs = [attenuation, contribution, phase attenuation]
+//    物理直觉：光在云里每散射一次，方向就更随机一点、能量就更弱一点。
+//    只做单次散射（octaves = 1）时，厚云会黑掉 —— 因为 exp(-τ) 直接趋零。
+float multiScattering(float opticalDepth, float cosTheta) {
+  vec3 coeffs = vec3(1.0);
+  vec3 attenuation = vec3(0.5, 0.5, 0.5);
+  float scattering = 0.0;
+
+  for (float i = 0.0; i < 16.0; i += 1.0) {
+    if (i >= u_multiScatterOctaves) break;
+    float beerLambert = exp(-opticalDepth * coeffs.y);
+    scattering += coeffs.x * beerLambert * phaseFunction(cosTheta, coeffs.z);
+    coeffs *= attenuation;
+  }
+  return scattering;
+}
+
+// ------------------------------------------------------------
+// ===== 本篇新增：时空蓝噪声（STBN）=====
+//
+// stbn.bin 是 128×128×64 的 R8 体积：X/Y 是空间，**Z 轴是时间**。
+// 每帧往后取一个 Z 切片，就得到「每个像素、每一帧」一个独立随机数。
+//
+// 为什么不用哈希或者白噪声？
+//   白噪声在空间上是**扎堆**的 —— 相邻像素的随机值可能很接近，
+//   平均掉之后会留下低频斑块（看起来像脏东西）。
+//   蓝噪声的频谱压在高频，任意小邻域里的取值都均匀铺开，
+//   所以累积收敛更快，也不会留下结构性图案。
+//
+// 注意：gl_FragCoord 是像素坐标，乘 1/尺寸 就变成 [0,1) 的 UV；
+// 采样器是 REPEAT，所以超出 128 像素会自然平铺，不用手动取模。
+// ------------------------------------------------------------
+float getSTBN() {
+  ivec3 size = textureSize(stbnTexture, 0);
+  vec3 scale = vec3(
+    1.0 / float(size.x), 1.0 / float(size.y), 1.0 / float(size.z)
+  );
+  float slice = mod(u_stbnFrame, float(size.z));
+  return texture(stbnTexture, vec3(gl_FragCoord.xy, slice) * scale).r;
+}
+
+      /**
+       * ===== 本篇新增：Bruneton 大气散射（查询侧）=====
+       *
+       * 原始实现是 Bruneton & Neyret 的 "Precomputed Atmospheric Scattering"，
+       * 那套代码用 typedef 包装了物理量（Number / Length / RadianceSpectrum …）。
+       * 这里把 typedef 展开成 GLSL 原生类型（float / vec3），公式一字未改。
+       *
+       * ⚠️ 单位：LUT 是按**公里**烤的，所有位置都要乘 METER_TO_LENGTH_UNIT。
+       *    本 demo 的「球坐标系」原点正好是半径 6360 km 的球心，
+       *    和大气模型的 bottom_radius 完全对得上，所以可以直接缩放。
+       */
+      const float ATM_PI = 3.14159265358979323846;
+      const float METER_TO_LENGTH_UNIT = 0.001;
+
+      // 纹理尺寸（和离线预计算时用的必须一致）
+      const int TRANSMITTANCE_TEXTURE_WIDTH = 256;
+      const int TRANSMITTANCE_TEXTURE_HEIGHT = 64;
+      const int SCATTERING_TEXTURE_R_SIZE = 32;
+      const int SCATTERING_TEXTURE_MU_SIZE = 128;
+      const int SCATTERING_TEXTURE_MU_S_SIZE = 32;
+      const int SCATTERING_TEXTURE_NU_SIZE = 8;
+      const int IRRADIANCE_TEXTURE_WIDTH = 64;
+      const int IRRADIANCE_TEXTURE_HEIGHT = 16;
+
+      // 大气参数（源库 AtmosphereParameters.DEFAULT，半径换算成 km）
+      const vec3 ATM_SOLAR_IRRADIANCE = vec3(1.474, 1.8504, 1.91198);
+      const float ATM_SUN_ANGULAR_RADIUS = 0.004675;
+      const float ATM_BOTTOM_RADIUS = 6360.0;
+      const float ATM_TOP_RADIUS = 6420.0;
+      const vec3 ATM_RAYLEIGH_SCATTERING = vec3(0.005802, 0.013558, 0.0331);
+      const vec3 ATM_MIE_SCATTERING = vec3(0.003996, 0.003996, 0.003996);
+      const vec3 ATM_MIE_EXTINCTION = vec3(0.00444, 0.00444, 0.00444);
+      const float ATM_MIE_PHASE_FUNCTION_G = 0.8;
+      const vec3 ATM_ABSORPTION_EXTINCTION = vec3(0.00065, 0.001881, 0.000085);
+      const float ATM_MU_S_MIN = -0.5;
+
+      // 相对亮度系数：LUT 里存的是辐射亮度，转成亮度时要乘
+      const vec3 SUN_SPECTRAL_RADIANCE_TO_LUMINANCE = vec3(1.297482, 0.923961, 0.877991);
+      const vec3 SKY_SPECTRAL_RADIANCE_TO_LUMINANCE = vec3(1.518359, 0.941727, 0.862554);
+
+      // ---- 基础工具 ----
+      float atmClampCosine(float mu) { return clamp(mu, -1.0, 1.0); }
+      float atmClampDistance(float d) { return max(d, 0.0); }
+      float atmClampRadius(float r) { return clamp(r, ATM_BOTTOM_RADIUS, ATM_TOP_RADIUS); }
+      float atmSafeSqrt(float a) { return sqrt(max(a, 0.0)); }
+
+      float atmDistanceToTopBoundary(float r, float mu) {
+        float discriminant = r * r * (mu * mu - 1.0) + ATM_TOP_RADIUS * ATM_TOP_RADIUS;
+        return atmClampDistance(-r * mu + atmSafeSqrt(discriminant));
+      }
+      bool atmRayIntersectsGround(float r, float mu) {
+        return mu < 0.0 && r * r * (mu * mu - 1.0) + ATM_BOTTOM_RADIUS * ATM_BOTTOM_RADIUS >= 0.0;
+      }
+      float atmTextureCoordFromUnitRange(float x, int textureSize) {
+        return 0.5 / float(textureSize) + x * (1.0 - 1.0 / float(textureSize));
+      }
+
+      // ---- 透射率 LUT（2D：r × mu）----
+      vec2 atmTransmittanceUvFromRMu(float r, float mu) {
+        float H = sqrt(ATM_TOP_RADIUS * ATM_TOP_RADIUS - ATM_BOTTOM_RADIUS * ATM_BOTTOM_RADIUS);
+        float rho = atmSafeSqrt(r * r - ATM_BOTTOM_RADIUS * ATM_BOTTOM_RADIUS);
+        float d = atmDistanceToTopBoundary(r, mu);
+        float dMin = ATM_TOP_RADIUS - r;
+        float dMax = rho + H;
+        float xMu = (d - dMin) / (dMax - dMin);
+        float xR = rho / H;
+        return vec2(atmTextureCoordFromUnitRange(xMu, TRANSMITTANCE_TEXTURE_WIDTH),
+                    atmTextureCoordFromUnitRange(xR, TRANSMITTANCE_TEXTURE_HEIGHT));
+      }
+      vec3 atmTransmittanceToTop(float r, float mu) {
+        return vec3(texture(transmittanceTexture, atmTransmittanceUvFromRMu(r, mu)).rgb);
+      }
+      vec3 atmTransmittance(float r, float mu, float d, bool rayIntersectsGround) {
+        float rD = atmClampRadius(sqrt(d * d + 2.0 * r * mu * d + r * r));
+        float muD = atmClampCosine((r * mu + d) / rD);
+        if (rayIntersectsGround) {
+          return min(atmTransmittanceToTop(rD, -muD) / atmTransmittanceToTop(r, -mu), vec3(1.0));
+        }
+        return min(atmTransmittanceToTop(r, mu) / atmTransmittanceToTop(rD, muD), vec3(1.0));
+      }
+      // 从某个点朝太阳看，大气挡掉多少
+      vec3 atmTransmittanceToSun(float r, float muS) {
+        float sinThetaH = ATM_BOTTOM_RADIUS / r;
+        float cosThetaH = -sqrt(max(1.0 - sinThetaH * sinThetaH, 0.0));
+        return atmTransmittanceToTop(r, muS) *
+          smoothstep(-sinThetaH * ATM_SUN_ANGULAR_RADIUS,
+                      sinThetaH * ATM_SUN_ANGULAR_RADIUS,
+                      muS - cosThetaH);
+      }
+
+      // ---- 相函数 ----
+      float atmRayleighPhase(float nu) {
+        return 3.0 / (16.0 * ATM_PI) * (1.0 + nu * nu);
+      }
+      float atmMiePhase(float g, float nu) {
+        float k = 3.0 / (8.0 * ATM_PI) * (1.0 - g * g) / (2.0 + g * g);
+        return k * (1.0 + nu * nu) / pow(1.0 + g * g - 2.0 * g * nu, 1.5);
+      }
+
+      // ---- 散射 LUT（3D：nu × mu_s × mu，R 轴打包）----
+      vec4 atmScatteringUvwz(float r, float mu, float muS, float nu, bool rayIntersectsGround) {
+        float H = sqrt(ATM_TOP_RADIUS * ATM_TOP_RADIUS - ATM_BOTTOM_RADIUS * ATM_BOTTOM_RADIUS);
+        float rho = atmSafeSqrt(r * r - ATM_BOTTOM_RADIUS * ATM_BOTTOM_RADIUS);
+        float uR = atmTextureCoordFromUnitRange(rho / H, SCATTERING_TEXTURE_R_SIZE);
+        float rMu = r * mu;
+        float discriminant = rMu * rMu - r * r + ATM_BOTTOM_RADIUS * ATM_BOTTOM_RADIUS;
+        float uMu;
+        if (rayIntersectsGround) {
+          float d = -rMu - atmSafeSqrt(discriminant);
+          float dMin = r - ATM_BOTTOM_RADIUS;
+          float dMax = rho;
+          uMu = 0.5 - 0.5 * atmTextureCoordFromUnitRange(
+            dMax == dMin ? 0.0 : (d - dMin) / (dMax - dMin), SCATTERING_TEXTURE_MU_SIZE / 2);
+        } else {
+          float d = -rMu + atmSafeSqrt(discriminant + H * H);
+          float dMin = ATM_TOP_RADIUS - r;
+          float dMax = rho + H;
+          uMu = 0.5 + 0.5 * atmTextureCoordFromUnitRange(
+            (d - dMin) / (dMax - dMin), SCATTERING_TEXTURE_MU_SIZE / 2);
+        }
+        float dSun = atmDistanceToTopBoundary(ATM_BOTTOM_RADIUS, muS);
+        float dMinS = ATM_TOP_RADIUS - ATM_BOTTOM_RADIUS;
+        float a = (dSun - dMinS) / (H - dMinS);
+        float dMinus = atmDistanceToTopBoundary(ATM_BOTTOM_RADIUS, ATM_MU_S_MIN);
+        float A = (dMinus - dMinS) / (H - dMinS);
+        float uMuS = atmTextureCoordFromUnitRange(max(1.0 - a / A, 0.0) / (1.0 + a),
+                                                  SCATTERING_TEXTURE_MU_S_SIZE);
+        float uNu = (nu + 1.0) / 2.0;
+        return vec4(uNu, uMuS, uMu, uR);
+      }
+      vec3 atmGetScattering(sampler3D tex, float r, float mu, float muS, float nu,
+                            bool rayIntersectsGround) {
+        vec4 uvwz = atmScatteringUvwz(r, mu, muS, nu, rayIntersectsGround);
+        float texCoordX = uvwz.x * float(SCATTERING_TEXTURE_NU_SIZE - 1);
+        float texX = floor(texCoordX);
+        float lerp = texCoordX - texX;
+        vec3 uvw0 = vec3((texX + uvwz.y) / float(SCATTERING_TEXTURE_NU_SIZE), uvwz.z, uvwz.w);
+        vec3 uvw1 = vec3((texX + 1.0 + uvwz.y) / float(SCATTERING_TEXTURE_NU_SIZE), uvwz.z, uvwz.w);
+        return vec3(texture(tex, uvw0).rgb * (1.0 - lerp) + texture(tex, uvw1).rgb * lerp);
+      }
+      // 从散射 LUT 里反推 Mie 单次散射（源库把 Mie 打包进了同一个纹理）
+      vec3 atmExtrapolateSingleMie(vec4 scattering) {
+        if (scattering.r < 1e-5) return vec3(0.0);
+        return scattering.rgb * scattering.a / scattering.r *
+          (ATM_RAYLEIGH_SCATTERING.r / ATM_MIE_SCATTERING.r) *
+          (ATM_MIE_SCATTERING / ATM_RAYLEIGH_SCATTERING);
+      }
+      vec3 atmCombinedScattering(float r, float mu, float muS, float nu,
+                                 bool rayIntersectsGround, out vec3 singleMie) {
+        vec4 uvwz = atmScatteringUvwz(r, mu, muS, nu, rayIntersectsGround);
+        float texCoordX = uvwz.x * float(SCATTERING_TEXTURE_NU_SIZE - 1);
+        float texX = floor(texCoordX);
+        float lerp = texCoordX - texX;
+        vec3 uvw0 = vec3((texX + uvwz.y) / float(SCATTERING_TEXTURE_NU_SIZE), uvwz.z, uvwz.w);
+        vec3 uvw1 = vec3((texX + 1.0 + uvwz.y) / float(SCATTERING_TEXTURE_NU_SIZE), uvwz.z, uvwz.w);
+        vec4 combined = texture(scatteringTexture, uvw0) * (1.0 - lerp) +
+                        texture(scatteringTexture, uvw1) * lerp;
+        singleMie = atmExtrapolateSingleMie(combined);
+        return vec3(combined.rgb);
+      }
+
+      // ---- 辐照度 LUT（2D：mu_s × r）----
+      vec3 atmIrradiance(float r, float muS) {
+        float xR = (r - ATM_BOTTOM_RADIUS) / (ATM_TOP_RADIUS - ATM_BOTTOM_RADIUS);
+        float xMuS = muS * 0.5 + 0.5;
+        vec2 uv = vec2(atmTextureCoordFromUnitRange(xMuS, IRRADIANCE_TEXTURE_WIDTH),
+                       atmTextureCoordFromUnitRange(xR, IRRADIANCE_TEXTURE_HEIGHT));
+        return vec3(texture(irradianceTexture, uv).rgb);
+      }
+
+      // ---- 太阳 + 天空辐照度（云的环境光就来自这儿）----
+      //
+      // 这是**余弦加权**版（源库的 GetSunAndSkyIrradiance）：
+      //   sun = solar × T_sun × max(dot(normal, sunDir), 0)
+      //   sky = Irradiance × (1 + dot(normal, point)/r) × 0.5
+      // 它描述的是「一个 Lambert 表面」收到的辐照度 —— 适合地面，不适合云。
+      vec3 atmSunAndSkyIrradiance(vec3 point, vec3 normal, vec3 sunDirection,
+                                  out vec3 skyIrradiance) {
+        float r = length(point);
+        float muS = dot(point, sunDirection) / r;
+        skyIrradiance = atmIrradiance(r, muS) * (1.0 + dot(normal, point) / r) * 0.5;
+        return ATM_SOLAR_IRRADIANCE * atmTransmittanceToSun(r, muS) *
+               max(dot(normal, sunDirection), 0.0);
+      }
+
+      /**
+       * ===== 修正：**标量**辐照度（源库的 GetSunAndSkyScalarIlluminance）=====
+       *
+       * 云不是表面，是**参与介质**：一个体积元从整个上半球各方向收光，
+       * 所以没有「法线」这回事，也就不该乘 cos 项。物理上正确的写法是对
+       * 上半球积分 —— 各向同性时正好等于「辐照度 × 2π」：
+       *
+       *   sun = solar_irradiance × T_sun          （无 cos 项）
+       *   sky = GetIrradiance(r, mu_s) × 2π
+       *
+       * 源库给云用的就是这个版本。
+       *
+       * 之前这里错用了余弦加权版、还把 normal 传成径向 shellDir，于是：
+       *   · 太阳光多乘一个 max(mu_s, 0) —— 正午 mu_s≈0.96 看不出，
+       *     黄昏 7° 时 mu_s≈0.12，云比源库暗约 8 倍，整片云发灰不暖；
+       *   · 天空光因 normal ∥ point 使 (1 + dot/r) 恒等于 2，再 ×0.5
+       *     就退化成 ×1.0，比源库弱 2π ≈ 6.28 倍 ——
+       *     这就是当初要拿 skyIrradianceScale = 4 去硬补的原因。
+       */
+      vec3 atmSunAndSkyScalarIrradiance(vec3 point, vec3 sunDirection,
+                                        out vec3 skyIrradiance) {
+        float r = length(point);
+        float muS = dot(point, sunDirection) / r;
+        skyIrradiance = atmIrradiance(r, muS) * 2.0 * ATM_PI;
+        return ATM_SOLAR_IRRADIANCE * atmTransmittanceToSun(r, muS);
+      }
+
+      // ---- 相机到某点的天空辐亮度（空气透视 + 光束都在这里）----
+      vec2 atmRaySphereIntersections(vec3 camera, vec3 direction, float radius) {
+        float b = 2.0 * dot(direction, camera);
+        float c = dot(camera, camera) - radius * radius;
+        float discriminant = b * b - 4.0 * c;
+        float Q = sqrt(max(discriminant, 0.0));
+        return vec2(-b - Q, -b + Q) * 0.5;
+      }
+      vec3 atmClosestPointOnRay(vec3 camera, vec3 point) {
+        vec3 ray = point - camera;
+        float t = clamp(-dot(camera, ray) / dot(ray, ray), 0.0, 1.0);
+        return camera + t * ray;
+      }
+      bool atmClipAtBottom(vec3 viewRay, inout vec3 camera, inout vec3 point) {
+        float rCamera = length(camera);
+        float rPoint = length(point);
+        bool cameraBelow = rCamera < ATM_BOTTOM_RADIUS;
+        bool pointBelow = rPoint < ATM_BOTTOM_RADIUS;
+        vec2 t = atmRaySphereIntersections(camera, viewRay, ATM_BOTTOM_RADIUS);
+        vec3 intersection = camera + viewRay * (cameraBelow ? t.y : t.x);
+        camera = cameraBelow ? intersection : camera;
+        point = pointBelow ? intersection : point;
+        return cameraBelow && pointBelow;
+      }
+
+      /**
+       * 相机 → point 这段路径上，大气贡献了多少散射光。
+       *
+       * shadow_length 是「被云挡掉的那一段长度」：只让**没被挡**的那部分
+       * 产生散射 —— 云缝里的光柱就是这么来的。
+       */
+      vec3 atmSkyRadianceToPoint(vec3 camera, vec3 point, float shadowLength,
+                                 vec3 sunDirection, out vec3 transmittance) {
+        if (length(atmClosestPointOnRay(camera, point)) > ATM_TOP_RADIUS) {
+          transmittance = vec3(1.0);
+          return vec3(0.0);
+        }
+        vec3 viewRay = normalize(point - camera);
+        if (atmClipAtBottom(viewRay, camera, point)) {
+          transmittance = vec3(1.0);
+          return vec3(0.0);
+        }
+        float r = length(camera);
+        float rmu = dot(camera, viewRay);
+        float distToTop = -rmu - atmSafeSqrt(rmu * rmu - r * r + ATM_TOP_RADIUS * ATM_TOP_RADIUS);
+        if (distToTop > 0.0) {
+          camera = camera + viewRay * distToTop;
+          r = ATM_TOP_RADIUS;
+          rmu += distToTop;
+        }
+        float mu = rmu / r;
+        float muS = dot(camera, sunDirection) / r;
+        float nu = dot(viewRay, sunDirection);
+        float d = length(point - camera);
+        bool hitsGround = atmRayIntersectsGround(r, mu);
+        if (!hitsGround) {
+          float muHorizon = -atmSafeSqrt(1.0 - (ATM_BOTTOM_RADIUS * ATM_BOTTOM_RADIUS) / (r * r));
+          mu = max(mu, muHorizon + 0.004);
+        }
+        transmittance = atmTransmittance(r, mu, d, hitsGround);
+
+        vec3 singleMie;
+        vec3 scattering = atmCombinedScattering(r, mu, muS, nu, hitsGround, singleMie);
+
+        d = max(d - shadowLength, 0.0);
+        float rP = atmClampRadius(sqrt(d * d + 2.0 * r * mu * d + r * r));
+        float muP = (r * mu + d) / rP;
+        float muSP = (r * muS + d * nu) / rP;
+        vec3 singleMieP;
+        vec3 scatteringP = atmCombinedScattering(rP, muP, muSP, nu, hitsGround, singleMieP);
+
+        vec3 shadowTransmittance = transmittance;
+        if (shadowLength > 0.0) {
+          shadowTransmittance = atmTransmittance(r, mu, d, hitsGround);
+        }
+        vec3 higherOrder = atmGetScattering(higherOrderScatteringTexture,
+                                            r, mu, muS, nu, hitsGround);
+        vec3 singleScattering = scattering - higherOrder;
+        vec3 higherOrderP = atmGetScattering(higherOrderScatteringTexture,
+                                             rP, muP, muSP, nu, hitsGround);
+        vec3 singleScatteringP = scatteringP - higherOrderP;
+
+        scattering = singleScattering - shadowTransmittance * singleScatteringP +
+                     higherOrder - transmittance * higherOrderP;
+        singleMie = singleMie - shadowTransmittance * singleMieP;
+        singleMie = atmExtrapolateSingleMie(vec4(scattering, singleMie.r));
+        singleMie = singleMie * smoothstep(0.0, 0.01, muS);
+
+        return scattering * atmRayleighPhase(nu) +
+               singleMie * atmMiePhase(ATM_MIE_PHASE_FUNCTION_G, nu);
+      }
+
+      // 亮度版包装（源库给云着色器调的就是这个）
+      vec3 atmSkyLuminanceToPoint(vec3 camera, vec3 point, float shadowLength,
+                                  vec3 sunDirection, out vec3 transmittance) {
+        return atmSkyRadianceToPoint(camera, point, shadowLength, sunDirection, transmittance) *
+               SKY_SPECTRAL_RADIANCE_TO_LUMINANCE;
+      }
+      // ===== 修正：改用**标量**辐照度（对齐源库）=====
+      // 云是参与介质，收的是整个上半球的光，没有 cos 项。
+      vec3 atmSunAndSkyIlluminance(vec3 point, vec3 sunDirection,
+                                   out vec3 skyIrradiance, float skyScale) {
+        vec3 sunIrradiance =
+          atmSunAndSkyScalarIrradiance(point, sunDirection, skyIrradiance);
+        skyIrradiance *= SKY_SPECTRAL_RADIANCE_TO_LUMINANCE * skyScale;
+        return sunIrradiance * SUN_SPECTRAL_RADIANCE_TO_LUMINANCE;
+      }
+
+void main(void) {
+  vec4 sceneColor = texture(colorTexture, v_textureCoordinates);
+
+  // ===== 本篇新增：抖动 =====
+  // 把视线在低分辨率像素内部挪一个亚像素位置。
+  // 每一帧的相位不同，累积起来就等于「这个像素被采样了很多次」。
+  vec2 uvJittered = v_textureCoordinates + u_jitter;
+
+  // —— 1. 从像素坐标构造世界空间视线方向 ——
+  vec2 ndc = uvJittered * 2.0 - 1.0;
+  vec3 rayDirection = normalize(
+    u_cameraDirection +
+    u_cameraRight * (ndc.x * u_tanHalfFov.x) +
+    u_cameraUp    * (ndc.y * u_tanHalfFov.y)
+  );
+
+  // ===== 本篇新增：视线与太阳的夹角余弦，相函数要用 =====
+  float cosTheta = dot(u_sunDirection, rayDirection);
+
+  // ===== 临时调试 =====
+  if (u_atmoDebug > 0.5) {
+    vec3 dbgOrigin = u_cameraPositionSphere;
+    if (u_atmoDebug > 2.5) {
+      if (u_atmoDebug < 3.5) {
+        out_FragColor = vec4(texture(transmittanceTexture, v_textureCoordinates).rgb, 1.0);
+      } else {
+        out_FragColor = vec4(texture(irradianceTexture, v_textureCoordinates).rgb * 4.0, 1.0);
+      }
+      return;
+    }
+    vec3 dbgDir = normalize(dbgOrigin + rayDirection * 3000.0);
+    vec3 dbgSky;
+    // ⚠️ 必须乘 METER_TO_LENGTH_UNIT：LUT 是按公里烤的，这里的位置是米。
+    //    不换算的话 atmTransmittanceToSun 里的 sinThetaH 会算成 0.001，
+    //    地球阴影那一项恒等于 1 —— 太阳永远不落山。
+    vec3 dbgSun = atmSunAndSkyIlluminance(
+      dbgDir * (u_bottomRadius + u_minHeight) * METER_TO_LENGTH_UNIT,
+      u_sunDirection, dbgSky, u_skyIrradianceScale);
+    out_FragColor = (u_atmoDebug < 1.5)
+      ? vec4(clamp(dbgSun / 2.0, 0.0, 1.0), 1.0)
+      : vec4(clamp(dbgSky / 3.0, 0.0, 1.0), 1.0);
+    return;
+  }
+
+
+  // ===== 光照调试视图 =====
+  if (u_lightDebug > 0.5 && u_lightDebug < 5.5) {
+    if (u_lightDebug < 1.5) {
+      out_FragColor = vec4(u_sunColor, 1.0);                 // 太阳色
+    } else if (u_lightDebug < 2.5) {
+      out_FragColor = vec4(vec3(cosTheta * 0.5 + 0.5), 1.0); // 视线与太阳夹角
+    } else if (u_lightDebug < 3.5) {
+      out_FragColor = vec4(u_skyColor, 1.0);                 // 天空光色
+    } else if (u_lightDebug < 4.5) {
+      out_FragColor = vec4(vec3(u_exposure / 60.0), 1.0);    // 曝光
+    } else {
+      out_FragColor = vec4(vec3(u_sunDirection * 0.5 + 0.5), 1.0);  // 太阳方向
+    }
+    return;
+  }
+  if (u_lightDebug > 7.5) {
+    // 多 uniform 检查：R=太阳色R  G=天空色B  B=天空光强度/5
+    out_FragColor = vec4(u_sunColor.r, u_skyColor.b, u_skyLightScale / 5.0, 1.0);
+    return;
+  }
+
+  // —— 2. 和云壳求交，拿到进出云层的区间 ——
+  float innerRadius = u_bottomRadius + u_minHeight;
+  float outerRadius = u_bottomRadius + u_maxHeight;
+
+  vec3 origin = u_cameraPositionSphere;
+  float cameraRadius = length(origin);
+
+  vec2 outerHit = raySphereIntersection(origin, rayDirection, outerRadius);
+  // 两个判断缺一不可：
+  //   outerHit.y <= 0  →  交点全在相机背后。相机在球外、视线朝上时就是这种情况，
+  //                       球在身后。只判「有没有实根」是不够的。
+  if (outerHit.y <= 0.0) {
+    // ===== 07：这里没有云，输出「不透明度 = 0」=====
+    // （云层 Pass 不再自己合成 sceneColor —— 要是这里还输出场景色，
+    //   会被 RESOLVE 当成不透明的云盖上去，整个场景变低分辨率马赛克）
+    out_FragColor = vec4(0.0);
+    return;
+  }
+
+  vec2 innerHit = raySphereIntersection(origin, rayDirection, innerRadius);
+  bool hitsGround = rayIntersectsGround(origin, rayDirection);
+
+  // ===== 本篇新增：地面交点（解析求交）=====
+  // 地面本身就是个已知的解析曲面，直接和它求交，比从深度纹理还原稳得多。
+  // 云影投到地面、以及「地面阴影」调试视图，都用这个交点。
+  vec2 groundHit = raySphereIntersection(origin, rayDirection, u_bottomRadius);
+  float tGround = groundHit.x > 0.0 ? groundHit.x : -1.0;
+
+  float tNear;
+  float tFar;
+  if (cameraRadius > outerRadius) {
+    // 相机在云层之上：从穿入外球开始
+    tNear = max(outerHit.x, 0.0);
+    // 如果视线会打到内球，就在那儿结束（穿出云底）；否则到外球背面
+    tFar = innerHit.x > 0.0 ? innerHit.x : outerHit.y;
+  } else if (cameraRadius > innerRadius) {
+    // 相机就在云层里：从眼前开始
+    tNear = 0.0;
+    tFar = innerHit.x > 0.0 ? innerHit.x : outerHit.y;
+  } else {
+    // 相机在云层之下。
+    // 视线朝下时射线会扎进地里 —— 这时看不到云，直接返回原色。
+    // （不返回的话，射线会从地球另一侧穿回云层半径区间，画出「地下的云」）
+    if (hitsGround) {
+      // 这条视线扎进地里，看不到云 —— 输出「没有云」。
+      // 地面云影不在这里做，搬到了 RESOLVE（那边才有场景颜色）。
+      //
+      // 调试视图：把这块地面收到的阴影画出来
+      if (u_shadowDebug > 0.5 && u_shadowDebug < 1.5 && tGround > 0.0) {
+        bool dbgOk = false;
+        float Td = shadowTransmittance(origin + rayDirection * tGround, dbgOk);
+        out_FragColor = vec4(vec3(dbgOk ? Td : 1.0), 1.0);
+        return;
+      }
+      out_FragColor = vec4(0.0);
+      return;
+    }
+    tNear = max(innerHit.y, 0.0);
+    tFar = outerHit.y;
+  }
+
+  tFar = min(tFar, tNear + u_maxDistance);
+  if (tFar <= tNear) {
+    // ===== 07：这里没有云，输出「不透明度 = 0」=====
+    // （云层 Pass 不再自己合成 sceneColor —— 要是这里还输出场景色，
+    //   会被 RESOLVE 当成不透明的云盖上去，整个场景变低分辨率马赛克）
+    out_FragColor = vec4(0.0);
+    return;
+  }
+
+  // ===== 本篇新增：步进相位 =====
+  // 固定从半步长处起步，误差会结成一层层的同心条带；
+  // 把相位打散，条带就变成了噪点 —— 噪点才可能被平均掉。
+  //
+  // 相位从哪来？优先用 STBN（时空蓝噪声：每个像素、每一帧一个
+  // 独立随机数，空间上还不扎堆），关掉就退回 Bayer 相位。
+  float stepPhase = u_useSTBN > 0.5 ? getSTBN() : u_stepJitter;
+
+  // ===== 本篇新增：云的太阳 / 天空辐照度 =====
+  // 每个采样点都查一次 LUT 太贵，所以只在**云壳底部和顶部**各查一次，
+  // 步进时按高度线性插值 —— 源库也是这么省的。
+  // 大气关掉时退回第 7 篇的常量色，方便对比。
+  vec3 sunBottom, sunTop, skyBottom, skyTop;
+  if (u_atmosphereEnabled > 0.5) {
+    vec3 shellDir = normalize(origin + rayDirection * tNear);
+    // ⚠️ 单位陷阱：LUT 是按**公里**烤的，而 u_bottomRadius / u_minHeight 都是**米**。
+    //    这里漏乘 METER_TO_LENGTH_UNIT 的话：
+    //      ① atmTransmittanceToSun 里 sinThetaH = 6360/6361200 ≈ 0.001，
+    //         cosThetaH ≈ -1，smoothstep 的自变量恒 > 0 → 地球阴影那一项恒为 1
+    //         → **太阳永远不落山，深夜的云还是白的**；
+    //      ② atmIrradiance / atmTransmittanceUvFromRMu 的 xR 会算成 1e5 量级，
+    //         纹理坐标饱和到「大气顶」那一行，等于一直在查错的行。
+    vec3 shellPosBottom =
+      shellDir * (u_bottomRadius + u_minHeight) * METER_TO_LENGTH_UNIT;
+    vec3 shellPosTop =
+      shellDir * (u_bottomRadius + u_maxHeight) * METER_TO_LENGTH_UNIT;
+    sunBottom = atmSunAndSkyIlluminance(
+      shellPosBottom, u_sunDirection, skyBottom, u_skyIrradianceScale);
+    sunTop = atmSunAndSkyIlluminance(
+      shellPosTop, u_sunDirection, skyTop, u_skyIrradianceScale);
+  } else {
+    sunBottom = sunTop = u_sunColor * u_sunIrradianceScale;
+    skyBottom = skyTop = u_skyColor * u_skyLightScale;
+  }
+
+  // —— 3. 等距步进，累加密度 ——
+  float stepLength = (tFar - tNear) / u_stepCount;
+  float transmittance = 1.0;
+  vec3 scattered = vec3(0.0);
+  // ===== 本篇新增：云的前表面距离（沿视线、从相机算起）=====
+  float cloudFrontDepth = -1.0;
+
+  for (float i = 0.0; i < 512.0; i += 1.0) {
+    if (i >= u_stepCount) break;
+
+    float t = tNear + (i + stepPhase) * stepLength;
+    vec3 positionSphere = origin + rayDirection * t;
+
+    float density = densityAt(positionSphere);
+    if (density > 0.0) {
+      // 第一次采到密度，就是云的「前表面」
+      if (cloudFrontDepth < 0.0) cloudFrontDepth = t;
+
+      float extinction = density * u_extinction;
+
+      // 层内高度比例，天空环境光要用
+      float hf = clamp(
+        (length(positionSphere) - (u_bottomRadius + u_minHeight)) /
+          (u_maxHeight - u_minHeight),
+        0.0,
+        1.0
+      );
+
+      // ===== 本篇新增：按高度插值出这个采样点的环境光 =====
+      vec3 sunIrradiance = mix(sunBottom, sunTop, hf);
+      vec3 skyIrradiance = mix(skyBottom, skyTop, hf);
+
+      if (u_lightingEnabled < 0.5) {
+        // —— 前三篇的做法：不管光照，直接叠加纯白 ——
+        float sampleTransmittance = exp(-extinction * stepLength);
+        scattered += transmittance * (1.0 - sampleTransmittance) * u_cloudColor;
+        transmittance *= sampleTransmittance;
+      } else {
+        // —— 本篇：走完整光照 ——
+
+        // ① Beer-Lambert：朝太阳步进求光学厚度
+        float opticalDepth = marchSunOpticalDepth(positionSphere, u_sunDirection);
+
+        // ===== 本篇新增：远处的遮挡从阴影图里取 =====
+        // 上面那一步只走 6 步、最远约 2.5 km，只够算一根云柱内部的上下遮挡。
+        // 阴影图存的是「整根云柱的透射率 T」，转回光学厚度就是 -log(T)。
+        // 这样「20 公里外那朵云挡住了太阳」才算得进来。
+        if (u_shadowsEnabled > 0.5) {
+          bool shadowValid = false;
+          float Tshadow = shadowTransmittance(positionSphere, shadowValid);
+          if (shadowValid) {
+            opticalDepth += -log(max(Tshadow, 1e-6));
+          }
+        }
+
+        // ② Oz 多重散射（octaves = 1 时退化成单次散射）
+        // ===== 本篇新增：太阳不再是常量色，改成「穿过大气后的太阳辐照度」=====
+        // 黄昏时蓝光被散射掉，剩下的偏红 —— 云就跟着变暖。
+        vec3 radiance = sunIrradiance * u_sunIrradianceScale *
+                        multiScattering(opticalDepth, cosTheta);
+
+        // 天空环境光：用一个粗糙的高度梯度，云顶比云底亮一点
+        float skyGradient = hf * 0.5 + 0.5;
+        // 天空环境光同样来自 LUT（整个天空的散射光积分）
+        radiance += skyIrradiance * RECIPROCAL_PI4 * skyGradient;
+
+        // 乘上散射系数。
+        //
+        // ⚠️ 这里必须是 extinction * albedo，不能是 density * 常数 ——
+        // 后面能量守恒积分要除以 extinction：
+        //     scatteringIntegral = radiance * (1 - T) / extinction
+        // 如果 radiance 用的系数和 extinction 不同量级，就会凭空放大。
+        // 源库里两者都等于密度，所以没这个问题。
+        float scattering = extinction * u_albedo;
+        radiance *= scattering;
+
+        // ③ Beer-Powder：稀疏处压暗，做出「糖霜」暗边。
+        //
+        // ⚠️ 这里用的是**归一化密度** density（0~1），不是 extinction。
+        //    源库里两者恰好相等（extinction = density × 1），写哪个都行；
+        //    本 demo 的 extinction = density × 0.003，小了 333 倍 ——
+        //    要是照抄成 exp(-extinction * 150)，指数几乎恒为 0，
+        //    因子就退化成常数 1 - 0.8 = 0.2，整朵云被无差别压暗 5 倍。
+        radiance *= 1.0 - u_powderScale * exp(-density * u_powderExponent);
+
+        // 能量守恒积分（Frostbite 5.6.3）
+        float sampleTransmittance = exp(-extinction * stepLength);
+        float clampedExtinction = max(extinction, 1e-7);
+        vec3 scatteringIntegral =
+          (radiance - radiance * sampleTransmittance) / clampedExtinction;
+        scattered += transmittance * scatteringIntegral;
+        transmittance *= sampleTransmittance;
+      }
+
+      if (transmittance < 0.01) break;   // 已经不透光了，提前退出
+    }
+  }
+
+  vec3 cloudColor = scattered;
+  float cloudAlpha = 1.0 - transmittance;
+
+  // ===== 本篇新增：场景深度测试 =====
+  bool depthValid = false;
+  float sceneEyeZ = readSceneEyeDepth(v_textureCoordinates, depthValid);
+
+  if (u_debugSceneDepth > 0.5) {
+    // 调试视图：场景深度可视化（近处暗、远处亮、天空纯白）
+    out_FragColor = vec4(vec3(depthValid ? fract(sceneEyeZ * 1e-4) : 1.0), 1.0);
+    return;
+  }
+
+  if (u_depthTestEnabled > 0.5 && depthValid && cloudFrontDepth > 0.0) {
+    // eyeZ 是「沿相机朝向」的深度，换算成「沿这条视线」的距离
+    float sceneAlongRay =
+      sceneEyeZ / max(dot(rayDirection, u_cameraDirection), 1e-5);
+
+    // 软化带：在云前表面附近留一条过渡，避免轮廓出现硬锯齿。
+    // 取距离的 2%，最少 50m。
+    float band = max(50.0, cloudFrontDepth * u_occlusionBandScale);
+    float visible = smoothstep(
+      cloudFrontDepth - band,
+      cloudFrontDepth + band,
+      sceneAlongRay
+    );
+    cloudAlpha *= visible;
+  }
+
+  // ===== 07：地面云影搬到了 RESOLVE 那一步 =====
+  // 云层 Pass 现在只输出「云层本身」，sceneColor 由 RESOLVE 负责合成，
+  // 所以阴影也得在那边乘 —— 在这里调 applyGroundShadow 已经没人接。
+
+  // ===== 调试视图 =====
+  // 2 = 直接看阴影图集本身：R = frontDist，G = 透射率，B = 云柱长度
+  if (u_shadowDebug > 1.5) {
+    out_FragColor = vec4(texture(shadowBuffer, v_textureCoordinates).rgb, 1.0);
+    return;
+  }
+  // 1 = 把「地面收到的阴影」画出来（白 = 晒得到太阳）
+  if (u_shadowDebug > 0.5) {
+    if (tGround <= 0.0) {
+      out_FragColor = vec4(1.0);                 // 这条视线没打到地面（看天空）
+      return;
+    }
+    vec3 scenePosDbg = origin + rayDirection * tGround;
+    bool dbgValid = false;
+    float Tdbg = shadowTransmittance(scenePosDbg, dbgValid);
+    out_FragColor = vec4(vec3(dbgValid ? Tdbg : 1.0), 1.0);
+    return;
+  }
+
+  // ===== 修正：曝光与色调映射**移出**云层 Pass =====
+  //
+  // 源库把云的辐射亮度一直保持**线性**，直到 ResolvePass 才做：
+  //     ÷α → × exposure → pow(contrast) → PBR Neutral → czm_inverseGamma → ×α
+  //
+  // 为什么必须放到最后？因为云是叠在 Cesium **已经色调映射 + gamma 编码过**
+  // 的场景色之上的。如果云还停在线性空间就直接相加：
+  //   · 高光没有曲线压，直接切白、丢细节；
+  //   · 云和 Cesium 自带的天空之间会出现一条亮度/色度的接缝。
+  // 所以在 Resolve 里必须用和 Cesium 同一条曲线（Khronos PBR Neutral +
+  // inverseGamma）把云也送到显示空间。
+  //
+  // 这里只保留调试视图需要的那一次乘法。
+  if (u_lightingEnabled > 0.5 && u_lightDebug > 6.5 && u_lightDebug < 7.5) {
+    cloudColor *= u_exposure;
+  }
+
+  // ===== 调试：直接看云的辐射亮度 =====
+  // ⚠️ 这两个视图输出的是**线性**值，之后还会被 RESOLVE 的显示变换
+  //    （× 曝光 → PBR Neutral → inverseGamma）过一遍。
+  //    所以「6.5 比 5.5 亮多少」才是要看的东西 —— 那就是曝光曲线。
+  if (u_lightDebug > 5.5 && u_lightDebug < 6.5) {
+    out_FragColor = vec4(scattered, 1.0);          // 未乘曝光的线性辐射
+    return;
+  }
+  if (u_lightDebug > 6.5 && u_lightDebug < 7.5) {
+    out_FragColor = vec4(cloudColor, 1.0);         // 乘过曝光的线性值
+    return;
+  }
+
+  // ===== 本篇新增：不再直接合成，而是输出「云层本身」=====
+  //   rgb = 预乘过不透明度的云颜色
+  //   a   = 云的不透明度
+  // 时间累积只能在「云」上做平均。如果这里先和场景合成，
+  // 地面和楼也会被一起平均 —— 相机一动，背景就糊了。
+  // 合成推迟到 RESOLVE_SHADER 里做。
+  vec3 premultiplied = cloudColor * cloudAlpha;
+
+  // ===== 本篇新增：空气透视 + 光束 =====
+  //
+  // 四个要点（都是踩过坑才明白的）：
+  //   ① 只算到**云的前表面**，不算到地面。源库也是这么做的。
+  //      算到地面的话路径长 20 多公里，透射率掉到 0.8/0.6，
+  //      整个画面会被压暗偏红 —— 那不是「远处发白」，是「整体发暗」。
+  //   ② 只作用在**云**上（乘 cloudAlpha），地面不参与。
+  //   ③ shadowLength 传进去，就得到光束：只让没被云挡住的那段产生散射。
+  //   ④ 合成式必须和源库一致：先 × T 衰减，再 + in-scatter。
+  if (u_atmosphereEnabled > 0.5 && u_aerialPerspective > 0.5 && cloudFrontDepth > 0.0) {
+    vec3 frontPos = origin + rayDirection * cloudFrontDepth;
+    float apSegment = distance(origin, frontPos);
+    if (apSegment > 1.0) {
+      float shaftLength = 0.0;
+      if (u_lightShafts > 0.5 && u_shadowsEnabled > 0.5) {
+        bool shaftOk = false;
+        float shaftT = shadowTransmittance(frontPos, shaftOk);
+        if (shaftOk) shaftLength = (1.0 - shaftT) * apSegment;
+      }
+      vec3 transmittanceAp;
+      vec3 inscatter = atmSkyLuminanceToPoint(
+        origin * METER_TO_LENGTH_UNIT,
+        frontPos * METER_TO_LENGTH_UNIT,
+        shaftLength * METER_TO_LENGTH_UNIT,
+        u_sunDirection, transmittanceAp);
+      // LUT 在极端角度下可能吐出非有限值，兜一层
+      transmittanceAp = clamp(transmittanceAp, vec3(0.0), vec3(1.0));
+      inscatter = max(inscatter, vec3(0.0));
+
+      // ===== 修正：in-scatter 的色相修正改成**可选**（默认关）=====
+      //
+      // 背景：Bruneton 的 GetExtrapolatedSingleMieScattering 从合并纹理里
+      // 还原 Mie 分量时，系数是红主导的 (1.0, 0.428, 0.175)。正午太阳在高处、
+      // 视线接近水平时 Mie 前向散射仍压过 Rayleigh —— 云会被染成橙色。
+      //
+      // ⚠️ 源库**不做**这个修正。之前之所以需要它，很可能是因为下面
+      //    「漏乘 transmittanceAp」把 in-scatter 的贡献放大了 ——
+      //    补回 × T 之后默认关掉，先看物理正确的结果；
+      //    若正午仍明显偏橙，再打开。
+      if (u_inscatterHueFix > 0.5) {
+        vec3 camKm = origin * METER_TO_LENGTH_UNIT;
+        float camR = length(camKm);
+        float camMuS = dot(camKm, u_sunDirection) / max(camR, 1.0);
+        vec3 sunTint = atmTransmittanceToSun(camR, camMuS);
+        float sunTintMax = max(max(sunTint.r, sunTint.g), sunTint.b);
+        if (sunTintMax > 1.0e-4) {
+          vec3 tint = sunTint / sunTintMax;
+          float lum = dot(inscatter, vec3(0.2126, 0.7152, 0.0722));
+          float tintLum = dot(tint, vec3(0.2126, 0.7152, 0.0722));
+          inscatter = tint * (lum / max(tintLum, 1.0e-4));
+        }
+      }
+
+      // 临时调试：9 = 直接看 in-scatter 本身的颜色
+      if (u_atmoDebug > 8.5) {
+        out_FragColor = vec4(clamp(inscatter * 2.0, 0.0, 1.0), 1.0);
+        return;
+      }
+      if (u_atmoDebug > 7.5) {
+        out_FragColor = vec4(transmittanceAp, 1.0);
+        return;
+      }
+      if (all(equal(transmittanceAp, transmittanceAp)) &&
+          all(equal(inscatter, inscatter))) {
+        // ===== 修正：补回「× transmittanceAp」（对齐源库）=====
+        // 源库 applyAerialPerspective 的合成式是：
+        //     color.rgb = color.rgb * transmittance + inscatter * color.a
+        //
+        // 之前这里**故意**丢掉了 × T，只加 in-scatter —— 于是远景只剩
+        // 「加了一层光」，少了「被大气吃掉一部分」：画面偏亮偏灰、对比度低。
+        //
+        // ⚠️ 顺序不能反：先对**已有的预乘颜色**乘 T 衰减，再加 in-scatter。
+        //    反过来的话 in-scatter 自己也会被衰减一次，远处会不自然地发暗。
+        //
+        // u_aerialScale 只作用在 in-scatter 上 —— 它是「雾有多浓」的观感旋钮，
+        // 默认 1.0 就是源库的行为。
+        premultiplied = premultiplied * transmittanceAp +
+                        inscatter * u_aerialScale * cloudAlpha;
+      }
+    }
+  }
+
+  out_FragColor = vec4(premultiplied, cloudAlpha);
+}
+
+`;
+
+      /**
+       * ===== 本篇新增：时间累积（TAAU resolve）=====
+       *
+       * 输入：
+       *   colorBuffer   —— 本帧的云层，低分辨率、抖动过。
+       *                    rgb 是**预乘**过的云颜色，a 是云的不透明度。
+       *   historyBuffer —— 上一帧累积下来的云层，全分辨率。
+       *
+       * 输出：混合后的云层，全分辨率。
+       *
+       * 注意这里累积的是「云层本身」，不是「合成后的画面」。
+       * 如果先和场景合成再累积，背景（地面、楼）会被一起平均 ——
+       * 相机一动，整片地就糊了。
+       */
+      const TEMPORAL_SHADER = `
+uniform sampler2D colorBuffer;
+uniform sampler2D historyBuffer;
+
+uniform vec2 u_lowResTexel;       // 1 / 低分辨率尺寸
+uniform float u_temporalAlpha;    // 当前帧的权重。越小，历史占的比重越大
+uniform float u_varianceGamma;    // 方差裁剪的松紧，越大越容易接受历史
+uniform float u_debug;            // 1 = 只看本帧低分辨率图  2 = 只看累积缓冲
+
+// —— 相机基底（当前帧 / 上一帧），重投影要用 ——
+uniform vec3 u_camPos;            // 相机在球坐标系里的位置
+uniform vec3 u_camDir;
+uniform vec3 u_camRight;
+uniform vec3 u_camUp;
+uniform vec2 u_tanHalfFov;
+uniform vec3 u_prevCamPos;
+uniform vec3 u_prevCamDir;
+uniform vec3 u_prevCamRight;
+uniform vec3 u_prevCamUp;
+uniform vec2 u_prevTanHalfFov;
+uniform float u_shellRadius;      // 云壳中面半径，用来给重投影定「深度」
+
+// Cesium 的全屏四边形顶点着色器会输出这个 varying，
+// 片元着色器必须自己声明 —— 它不会自动注入。
+in vec2 v_textureCoordinates;
+
+// ------------------------------------------------------------
+// 沿视线走到半径 r 的球面，返回距离。
+// 相机在球内时取正根（云壳就是这个情况）。
+// ------------------------------------------------------------
+float shellDistance(vec3 origin, vec3 dir, float r) {
+  float b = dot(origin, dir);
+  float c = dot(origin, origin) - r * r;
+  float d = b * b - c;
+  if (d < 0.0) return -1.0;
+  float sq = sqrt(d);
+  float t0 = -b - sq;
+  float t1 = -b + sq;
+  return t0 > 0.0 ? t0 : t1;
+}
+
+// ------------------------------------------------------------
+// 方差裁剪：把历史颜色夹进「当前帧 3×3 邻域」的 均值 ± γσ。
+//
+// 这是 TAA 防鬼影的关键一步。不加它，只要重投影稍微不准，
+// 历史里那团云就会拖出一条尾巴 —— 而且每帧都在往里喂，
+// 尾巴会越拖越长，最后糊成一片。
+//
+// 用邻域的**均值 + 标准差**而不是简单的 min/max，是为了让
+// 裁剪范围自适应：平坦区域收得很紧（坚决不拖影），
+// 高频区域放得宽（保留细节，不过度抹平）。
+// ------------------------------------------------------------
+vec4 clipToNeighborhood(vec4 history, vec2 uv, vec2 texel, float gamma) {
+  vec4 m1 = vec4(0.0);
+  vec4 m2 = vec4(0.0);
+  for (int y = -1; y <= 1; ++y) {
+    for (int x = -1; x <= 1; ++x) {
+      vec4 c = texture(colorBuffer, uv + vec2(float(x), float(y)) * texel);
+      m1 += c;
+      m2 += c * c;
+    }
+  }
+  m1 /= 9.0;
+  m2 /= 9.0;
+  vec4 sigma = sqrt(max(vec4(0.0), m2 - m1 * m1));
+  return clamp(history, m1 - gamma * sigma, m1 + gamma * sigma);
+}
+
+void main() {
+  vec2 uv = v_textureCoordinates;
+
+  // 调试：直接看累积缓冲（能看到「历史」长什么样）
+  if (u_debug > 1.5) {
+    out_FragColor = texture(historyBuffer, uv);
+    return;
+  }
+
+  // 本帧的云：低分辨率纹理用线性过滤采样 —— 这一步就是「上采样」
+  vec4 current = texture(colorBuffer, uv);
+
+  // 调试：关掉累积，噪点原样呈现
+  if (u_debug > 0.5) {
+    out_FragColor = current;
+    return;
+  }
+
+  // —— 1. 重投影 ——
+  // 这个像素看到的那个「空间点」，上一帧落在屏幕的哪个位置？
+  //
+  // 云层的深度取「云壳中面」的解析解：低分辨率缓冲里没有多余的
+  // 通道放深度（rgba 已经给了颜色和不透明度），而云层本身是一层
+  // 1.8 km 厚的壳，用中面做重投影的误差在亚像素量级，够用。
+  vec2 ndc = uv * 2.0 - 1.0;
+  vec3 rayDir = normalize(
+    u_camDir +
+    u_camRight * (ndc.x * u_tanHalfFov.x) +
+    u_camUp    * (ndc.y * u_tanHalfFov.y)
+  );
+  float t = shellDistance(u_camPos, rayDir, u_shellRadius);
+  vec3 point = u_camPos + rayDir * t;
+
+  // 把这个世界点，用**上一帧**的相机基底投回屏幕
+  vec3 rel = point - u_prevCamPos;
+  float z = dot(rel, u_prevCamDir);
+  if (t <= 0.0 || z <= 1.0) {
+    out_FragColor = current;      // 历史不可用，本帧说了算
+    return;
+  }
+  vec2 prevNdc = vec2(
+    dot(rel, u_prevCamRight) / (z * u_prevTanHalfFov.x),
+    dot(rel, u_prevCamUp)    / (z * u_prevTanHalfFov.y)
+  );
+  vec2 prevUv = prevNdc * 0.5 + 0.5;
+  if (prevUv.x < 0.0 || prevUv.x > 1.0 || prevUv.y < 0.0 || prevUv.y > 1.0) {
+    out_FragColor = current;      // 跑到屏幕外了（相机转太快），丢弃历史
+    return;
+  }
+
+  // —— 2. 取历史，并夹进当前帧的邻域 ——
+  vec4 history = texture(historyBuffer, prevUv);
+  history = clipToNeighborhood(history, uv, u_lowResTexel, u_varianceGamma);
+
+  // —— 3. 混合：α 是「本帧」的权重 ——
+  out_FragColor = mix(history, current, u_temporalAlpha);
+}
+`;
+
+      /**
+       * ===== 本篇新增：一张离屏渲染目标 =====
+       *
+       * 时间累积要「读 A 写 B，下一帧读 B 写 A」来回倒（ping-pong）。
+       * 但 Cesium 的 PostProcessStage 只能渲染到屏幕，没法指定输出纹理，
+       * 所以这里用 Cesium 底层的 Renderer API 自己建一对。
+       */
+      class RenderTarget {
+        constructor(context, { width, height, pixelDatatype }) {
+          this.context = context;
+          this.width = width;
+          this.height = height;
+          this.texture = new Cesium.Texture({
+            context,
+            width,
+            height,
+            pixelFormat: Cesium.PixelFormat.RGBA,
+            pixelDatatype,
+            sampler: new Cesium.Sampler({
+              wrapS: Cesium.TextureWrap.CLAMP_TO_EDGE,
+              wrapT: Cesium.TextureWrap.CLAMP_TO_EDGE,
+              minificationFilter: Cesium.TextureMinificationFilter.LINEAR,
+              magnificationFilter: Cesium.TextureMagnificationFilter.LINEAR,
+            }),
+          });
+          this.framebuffer = new Cesium.Framebuffer({
+            context,
+            colorTextures: [this.texture],
+            destroyAttachments: false,
+          });
+          this.clear();
+        }
+
+        clear() {
+          const cmd = new Cesium.ClearCommand({
+            color: new Cesium.Color(0, 0, 0, 0),
+            framebuffer: this.framebuffer,
+          });
+          cmd.execute(this.context);
+        }
+
+        destroy() {
+          if (this.framebuffer && !this.framebuffer.isDestroyed()) {
+            this.framebuffer.destroy();
+          }
+          if (this.texture && !this.texture.isDestroyed()) {
+            this.texture.destroy();
+          }
+          this.framebuffer = null;
+          this.texture = null;
+        }
+      }
+
+      /**
+       * ===== 本篇新增：一个全屏绘制命令 =====
+       * 把一段片元着色器跑满整张目标纹理。
+       * uniforms 里的值可以是常量，也可以是每帧现算的函数。
+       */
+      class FullscreenPass {
+        constructor(context, { fragmentShader, framebuffer, width, height, uniforms }) {
+          this.context = context;
+          this.uniforms = uniforms || {};
+          const uniformMap = {};
+          for (const k of Object.keys(this.uniforms)) {
+            uniformMap[k] = () => {
+              const v = this.uniforms[k];
+              return typeof v === "function" ? v() : v;
+            };
+          }
+          this.clearCommand = new Cesium.ClearCommand({
+            color: new Cesium.Color(0, 0, 0, 0),
+            framebuffer,
+          });
+          this.command = context.createViewportQuadCommand(fragmentShader, {
+            framebuffer,
+            uniformMap,
+            renderState: Cesium.RenderState.fromCache({
+              viewport: new Cesium.BoundingRectangle(0, 0, width, height),
+              depthTest: { enabled: false },
+              depthMask: false,
+              blending: Cesium.BlendingState.DISABLED,
+            }),
+          });
+        }
+
+        setFramebuffer(framebuffer) {
+          this.command.framebuffer = framebuffer;
+          this.clearCommand.framebuffer = framebuffer;
+        }
+
+        execute() {
+          this.clearCommand.execute(this.context);
+          this.command.execute(this.context);
+        }
+
+        destroy() {
+          if (this.command && this.command.shaderProgram) {
+            this.command.shaderProgram.destroy();
+          }
+          this.command = null;
+        }
+      }
+
+      /**
+       * ===== 本篇新增：把累积结果合成到屏幕 =====
+       *
+       * 07 的**合成全部在这一层做**，包括地面云影 ——
+       * 因为云层 Pass 只输出「云层本身」，sceneColor 只有这里才有。
+       * （06 里云影是乘在云着色器的 sceneColor 上的，07 必须把它搬过来。）
+       */
+      const RESOLVE_SHADER = `
+uniform sampler2D colorTexture;      // 场景颜色，Cesium 自动绑定
+uniform sampler2D cloudBuffer;       // 本帧云层（低分辨率）
+uniform sampler2D historyBuffer;     // 累积后的云层（全分辨率）
+uniform float u_temporalEnabled;
+uniform float u_temporalDebug;
+
+// —— 地面云影要用到的（云着色器里已经声明过，这里再声明一遍）——
+uniform float u_bottomRadius;
+uniform float u_minHeight;
+uniform float u_maxHeight;
+uniform vec3 u_sunDirection;
+uniform vec3 u_groundCenterSphere;
+uniform vec3 u_eastDir;
+uniform vec3 u_northDir;
+uniform vec3 u_cascadeSize;
+uniform sampler2D depthTexture;      // readSceneEyeDepth 用得到（这一层其实用不上）
+uniform vec3 u_cameraPositionSphere;
+uniform vec3 u_cameraDirection;
+uniform vec3 u_cameraRight;
+uniform vec3 u_cameraUp;
+uniform vec2 u_tanHalfFov;
+
+in vec2 v_textureCoordinates;
+
+// ------------------------------------------------------------
+// 下面这一整段（射线求交 + 阴影图查询 + 地面云影）是从云着色器里
+// **原样搬过来的** —— make07.py 生成时自动抽取，保证两边不会漂移。
+// ------------------------------------------------------------
+vec2 raySphereIntersection(vec3 rayOrigin, vec3 rayDirection, float radius) {
+  float b = dot(rayOrigin, rayDirection);
+  float c = dot(rayOrigin, rayOrigin) - radius * radius;
+  float h = b * b - c;
+  if (h < 0.0) {
+    return vec2(-1.0);
+  }
+  h = sqrt(h);
+  return vec2(-b - h, -b + h);
+}
+
+
+// ============================================================
+// 【本篇新增】阴影图的读取端
+// ============================================================
+uniform sampler2D shadowBuffer;       // 阴影图集
+// ===== 本篇新增：抖动 =====
+uniform vec2 u_jitter;                // 亚像素抖动（UV 偏移）
+uniform float u_stepJitter;           // 步进相位（Bayer，0~1）
+uniform sampler3D stbnTexture;        // 时空蓝噪声 128×128×64，Z = 时间切片
+// ===== 本篇新增：大气 LUT =====
+uniform sampler2D transmittanceTexture;      // 透射率 256×64
+uniform sampler2D irradianceTexture;         // 辐照度 64×16
+uniform sampler3D scatteringTexture;         // 散射 256×128×32
+uniform sampler3D higherOrderScatteringTexture;  // 高阶散射（同一尺寸）
+uniform float u_atmosphereEnabled;
+uniform float u_skyIrradianceScale;
+uniform float u_sunIrradianceScale;
+uniform float u_aerialPerspective;
+uniform float u_lightShafts;
+uniform float u_aerialScale;
+uniform float u_inscatterHueFix;      // 1 = 用太阳透射率换 in-scatter 色相（源库不做）
+uniform float u_atmoDebug;
+uniform float u_stbnFrame;            // 当前帧号，决定取哪个 Z 切片
+uniform float u_useSTBN;              // 1 = 用 STBN，0 = 退回 Bayer 相位
+uniform float u_shadowsEnabled;
+uniform float u_shadowCascadeCount;
+uniform float u_shadowTexelSize;      // 图集里一个纹素的 UV 宽度
+uniform float u_shadowIntensity;      // 云影强度（拖到 0 就是关掉，方便对比）
+uniform float u_shadowBlur;           // PCF 采样半径（纹素）
+uniform float u_castShadowOnScene;    // 是否把云影投到地面
+uniform float u_shadowOnSceneIntensity;
+uniform float u_shadowDebug;
+
+vec4 readShadowTile(vec2 tileUv, float cascadeIndex) {
+  vec2 uv = vec2(
+    (clamp(tileUv.x, 0.0, 1.0) + cascadeIndex) / u_shadowCascadeCount,
+    clamp(tileUv.y, 0.0, 1.0)
+  );
+  return texture(shadowBuffer, uv);
+}
+
+// 给定云层里的一个点 p，返回它朝太阳方向看到多少光。
+//
+// 思路：
+//   ① 沿太阳方向把 p 投影到云顶平面，得到阴影图上的位置
+//   ② 从阴影图读出「整根云柱的透射率」和「云柱有多长」
+//   ③ 只算 p 上面那一截：
+//        frac = (p 到云前表面的距离) / 云柱长度
+//        T = T_total ^ frac
+//      p 在云顶之上 → frac = 0 → T = 1（完全晒得到太阳）
+//      p 在云底 → frac = 1 → T = T_total
+// ------------------------------------------------------------
+float shadowTransmittance(vec3 p, out bool valid) {
+  valid = false;
+  if (u_shadowsEnabled < 0.5) return 1.0;
+
+  vec3 up = normalize(p);
+  float alt = length(p) - u_bottomRadius;
+  float upDotSun = dot(up, u_sunDirection);
+  if (upDotSun < 1e-3) return 1.0;            // 太阳已经在地平线下
+
+  // ① 投影到云顶平面
+  float dTop = (u_maxHeight - alt) / upDotSun;
+  if (dTop < 0.0) return 1.0;                 // 已经在云顶之上
+
+  vec3 Q = p + u_sunDirection * dTop;
+
+  // 落到「相机正下方」那个局部地面坐标系里
+  vec3 rel = Q - u_groundCenterSphere;
+  vec2 planar = vec2(dot(rel, u_eastDir), dot(rel, u_northDir));
+  float distH = length(planar);
+
+  // ② 选级联：第一个能覆盖住这个距离的
+  float cascadeIndex = 2.0;
+  float size = u_cascadeSize.z;
+  if (distH < u_cascadeSize.x * 0.5) {
+    cascadeIndex = 0.0; size = u_cascadeSize.x;
+  } else if (distH < u_cascadeSize.y * 0.5) {
+    cascadeIndex = 1.0; size = u_cascadeSize.y;
+  }
+  if (distH >= size * 0.5) return 1.0;        // 超出最远一级
+
+  vec2 tileUv = planar / size + 0.5;
+  valid = true;
+
+  // ③ PCF：4 个绕圈的采样点。单点采样在云的边缘会有明显的阶梯。
+  float r = u_shadowBlur * u_shadowTexelSize * size;
+  float T = 0.0;
+  for (float i = 0.0; i < 4.0; i += 1.0) {
+    float a = (i + 0.5) * 1.5707963;
+    vec2 off = vec2(cos(a), sin(a)) * r / size;
+    vec4 sh = readShadowTile(tileUv + off, cascadeIndex);
+    float frontDist = sh.r * 8192.0;
+    float cloudDist = max(sh.b * 8192.0, 1.0);
+    float dToFront = max(0.0, dTop - frontDist);
+    float frac = clamp(dToFront / cloudDist, 0.0, 1.0);
+    T += pow(sh.g, frac);
+  }
+  T *= 0.25;
+
+  return mix(1.0, T, u_shadowIntensity);
+}
+
+// ------------------------------------------------------------
+// 把「这块地面收到的云影」乘进颜色里。
+//
+// 地面位置用**射线 × 地面球解析求交**，不从深度纹理还原 —— 两个原因：
+//   ① 俯视时深度值会饱和到 1.0，被 readSceneEyeDepth 判成「天空」，
+//      整条阴影路径静默失效（打开深度调试视图会看到整屏纯白）；
+//   ② 深度给的是**场景表面**（含楼顶、地形起伏），拿它算阴影，
+//      影子会随视角漂移 —— 可太阳在 1.5 亿公里外，
+//      转个视角根本不该让地面的影子挪位置。
+//
+// 单独抽成函数，是因为有两个地方要用：正常路径，以及
+// 「相机在云层之下、视线扎进地面」那条早退分支（低空飞行时最常走）。
+// ------------------------------------------------------------
+void applyGroundShadow(inout vec3 color, vec3 rayOrigin, vec3 rayDir) {
+  if (u_shadowsEnabled < 0.5 || u_castShadowOnScene < 0.5) return;
+  vec2 gh = raySphereIntersection(rayOrigin, rayDir, u_bottomRadius);
+  if (gh.x <= 0.0) return;                    // 这条视线没打到地面
+  bool ok = false;
+  float T = shadowTransmittance(rayOrigin + rayDir * gh.x, ok);
+  if (ok) color *= mix(1.0, T, u_shadowOnSceneIntensity);
+}
+
+
+      /**
+       * ===== 本篇新增：Bruneton 大气散射（查询侧）=====
+       *
+       * 原始实现是 Bruneton & Neyret 的 "Precomputed Atmospheric Scattering"，
+       * 那套代码用 typedef 包装了物理量（Number / Length / RadianceSpectrum …）。
+       * 这里把 typedef 展开成 GLSL 原生类型（float / vec3），公式一字未改。
+       *
+       * ⚠️ 单位：LUT 是按**公里**烤的，所有位置都要乘 METER_TO_LENGTH_UNIT。
+       *    本 demo 的「球坐标系」原点正好是半径 6360 km 的球心，
+       *    和大气模型的 bottom_radius 完全对得上，所以可以直接缩放。
+       */
+      const float ATM_PI = 3.14159265358979323846;
+      const float METER_TO_LENGTH_UNIT = 0.001;
+
+      // 纹理尺寸（和离线预计算时用的必须一致）
+      const int TRANSMITTANCE_TEXTURE_WIDTH = 256;
+      const int TRANSMITTANCE_TEXTURE_HEIGHT = 64;
+      const int SCATTERING_TEXTURE_R_SIZE = 32;
+      const int SCATTERING_TEXTURE_MU_SIZE = 128;
+      const int SCATTERING_TEXTURE_MU_S_SIZE = 32;
+      const int SCATTERING_TEXTURE_NU_SIZE = 8;
+      const int IRRADIANCE_TEXTURE_WIDTH = 64;
+      const int IRRADIANCE_TEXTURE_HEIGHT = 16;
+
+      // 大气参数（源库 AtmosphereParameters.DEFAULT，半径换算成 km）
+      const vec3 ATM_SOLAR_IRRADIANCE = vec3(1.474, 1.8504, 1.91198);
+      const float ATM_SUN_ANGULAR_RADIUS = 0.004675;
+      const float ATM_BOTTOM_RADIUS = 6360.0;
+      const float ATM_TOP_RADIUS = 6420.0;
+      const vec3 ATM_RAYLEIGH_SCATTERING = vec3(0.005802, 0.013558, 0.0331);
+      const vec3 ATM_MIE_SCATTERING = vec3(0.003996, 0.003996, 0.003996);
+      const vec3 ATM_MIE_EXTINCTION = vec3(0.00444, 0.00444, 0.00444);
+      const float ATM_MIE_PHASE_FUNCTION_G = 0.8;
+      const vec3 ATM_ABSORPTION_EXTINCTION = vec3(0.00065, 0.001881, 0.000085);
+      const float ATM_MU_S_MIN = -0.5;
+
+      // 相对亮度系数：LUT 里存的是辐射亮度，转成亮度时要乘
+      const vec3 SUN_SPECTRAL_RADIANCE_TO_LUMINANCE = vec3(1.297482, 0.923961, 0.877991);
+      const vec3 SKY_SPECTRAL_RADIANCE_TO_LUMINANCE = vec3(1.518359, 0.941727, 0.862554);
+
+      // ---- 基础工具 ----
+      float atmClampCosine(float mu) { return clamp(mu, -1.0, 1.0); }
+      float atmClampDistance(float d) { return max(d, 0.0); }
+      float atmClampRadius(float r) { return clamp(r, ATM_BOTTOM_RADIUS, ATM_TOP_RADIUS); }
+      float atmSafeSqrt(float a) { return sqrt(max(a, 0.0)); }
+
+      float atmDistanceToTopBoundary(float r, float mu) {
+        float discriminant = r * r * (mu * mu - 1.0) + ATM_TOP_RADIUS * ATM_TOP_RADIUS;
+        return atmClampDistance(-r * mu + atmSafeSqrt(discriminant));
+      }
+      bool atmRayIntersectsGround(float r, float mu) {
+        return mu < 0.0 && r * r * (mu * mu - 1.0) + ATM_BOTTOM_RADIUS * ATM_BOTTOM_RADIUS >= 0.0;
+      }
+      float atmTextureCoordFromUnitRange(float x, int textureSize) {
+        return 0.5 / float(textureSize) + x * (1.0 - 1.0 / float(textureSize));
+      }
+
+      // ---- 透射率 LUT（2D：r × mu）----
+      vec2 atmTransmittanceUvFromRMu(float r, float mu) {
+        float H = sqrt(ATM_TOP_RADIUS * ATM_TOP_RADIUS - ATM_BOTTOM_RADIUS * ATM_BOTTOM_RADIUS);
+        float rho = atmSafeSqrt(r * r - ATM_BOTTOM_RADIUS * ATM_BOTTOM_RADIUS);
+        float d = atmDistanceToTopBoundary(r, mu);
+        float dMin = ATM_TOP_RADIUS - r;
+        float dMax = rho + H;
+        float xMu = (d - dMin) / (dMax - dMin);
+        float xR = rho / H;
+        return vec2(atmTextureCoordFromUnitRange(xMu, TRANSMITTANCE_TEXTURE_WIDTH),
+                    atmTextureCoordFromUnitRange(xR, TRANSMITTANCE_TEXTURE_HEIGHT));
+      }
+      vec3 atmTransmittanceToTop(float r, float mu) {
+        return vec3(texture(transmittanceTexture, atmTransmittanceUvFromRMu(r, mu)).rgb);
+      }
+      vec3 atmTransmittance(float r, float mu, float d, bool rayIntersectsGround) {
+        float rD = atmClampRadius(sqrt(d * d + 2.0 * r * mu * d + r * r));
+        float muD = atmClampCosine((r * mu + d) / rD);
+        if (rayIntersectsGround) {
+          return min(atmTransmittanceToTop(rD, -muD) / atmTransmittanceToTop(r, -mu), vec3(1.0));
+        }
+        return min(atmTransmittanceToTop(r, mu) / atmTransmittanceToTop(rD, muD), vec3(1.0));
+      }
+      // 从某个点朝太阳看，大气挡掉多少
+      vec3 atmTransmittanceToSun(float r, float muS) {
+        float sinThetaH = ATM_BOTTOM_RADIUS / r;
+        float cosThetaH = -sqrt(max(1.0 - sinThetaH * sinThetaH, 0.0));
+        return atmTransmittanceToTop(r, muS) *
+          smoothstep(-sinThetaH * ATM_SUN_ANGULAR_RADIUS,
+                      sinThetaH * ATM_SUN_ANGULAR_RADIUS,
+                      muS - cosThetaH);
+      }
+
+      // ---- 相函数 ----
+      float atmRayleighPhase(float nu) {
+        return 3.0 / (16.0 * ATM_PI) * (1.0 + nu * nu);
+      }
+      float atmMiePhase(float g, float nu) {
+        float k = 3.0 / (8.0 * ATM_PI) * (1.0 - g * g) / (2.0 + g * g);
+        return k * (1.0 + nu * nu) / pow(1.0 + g * g - 2.0 * g * nu, 1.5);
+      }
+
+      // ---- 散射 LUT（3D：nu × mu_s × mu，R 轴打包）----
+      vec4 atmScatteringUvwz(float r, float mu, float muS, float nu, bool rayIntersectsGround) {
+        float H = sqrt(ATM_TOP_RADIUS * ATM_TOP_RADIUS - ATM_BOTTOM_RADIUS * ATM_BOTTOM_RADIUS);
+        float rho = atmSafeSqrt(r * r - ATM_BOTTOM_RADIUS * ATM_BOTTOM_RADIUS);
+        float uR = atmTextureCoordFromUnitRange(rho / H, SCATTERING_TEXTURE_R_SIZE);
+        float rMu = r * mu;
+        float discriminant = rMu * rMu - r * r + ATM_BOTTOM_RADIUS * ATM_BOTTOM_RADIUS;
+        float uMu;
+        if (rayIntersectsGround) {
+          float d = -rMu - atmSafeSqrt(discriminant);
+          float dMin = r - ATM_BOTTOM_RADIUS;
+          float dMax = rho;
+          uMu = 0.5 - 0.5 * atmTextureCoordFromUnitRange(
+            dMax == dMin ? 0.0 : (d - dMin) / (dMax - dMin), SCATTERING_TEXTURE_MU_SIZE / 2);
+        } else {
+          float d = -rMu + atmSafeSqrt(discriminant + H * H);
+          float dMin = ATM_TOP_RADIUS - r;
+          float dMax = rho + H;
+          uMu = 0.5 + 0.5 * atmTextureCoordFromUnitRange(
+            (d - dMin) / (dMax - dMin), SCATTERING_TEXTURE_MU_SIZE / 2);
+        }
+        float dSun = atmDistanceToTopBoundary(ATM_BOTTOM_RADIUS, muS);
+        float dMinS = ATM_TOP_RADIUS - ATM_BOTTOM_RADIUS;
+        float a = (dSun - dMinS) / (H - dMinS);
+        float dMinus = atmDistanceToTopBoundary(ATM_BOTTOM_RADIUS, ATM_MU_S_MIN);
+        float A = (dMinus - dMinS) / (H - dMinS);
+        float uMuS = atmTextureCoordFromUnitRange(max(1.0 - a / A, 0.0) / (1.0 + a),
+                                                  SCATTERING_TEXTURE_MU_S_SIZE);
+        float uNu = (nu + 1.0) / 2.0;
+        return vec4(uNu, uMuS, uMu, uR);
+      }
+      vec3 atmGetScattering(sampler3D tex, float r, float mu, float muS, float nu,
+                            bool rayIntersectsGround) {
+        vec4 uvwz = atmScatteringUvwz(r, mu, muS, nu, rayIntersectsGround);
+        float texCoordX = uvwz.x * float(SCATTERING_TEXTURE_NU_SIZE - 1);
+        float texX = floor(texCoordX);
+        float lerp = texCoordX - texX;
+        vec3 uvw0 = vec3((texX + uvwz.y) / float(SCATTERING_TEXTURE_NU_SIZE), uvwz.z, uvwz.w);
+        vec3 uvw1 = vec3((texX + 1.0 + uvwz.y) / float(SCATTERING_TEXTURE_NU_SIZE), uvwz.z, uvwz.w);
+        return vec3(texture(tex, uvw0).rgb * (1.0 - lerp) + texture(tex, uvw1).rgb * lerp);
+      }
+      // 从散射 LUT 里反推 Mie 单次散射（源库把 Mie 打包进了同一个纹理）
+      vec3 atmExtrapolateSingleMie(vec4 scattering) {
+        if (scattering.r < 1e-5) return vec3(0.0);
+        return scattering.rgb * scattering.a / scattering.r *
+          (ATM_RAYLEIGH_SCATTERING.r / ATM_MIE_SCATTERING.r) *
+          (ATM_MIE_SCATTERING / ATM_RAYLEIGH_SCATTERING);
+      }
+      vec3 atmCombinedScattering(float r, float mu, float muS, float nu,
+                                 bool rayIntersectsGround, out vec3 singleMie) {
+        vec4 uvwz = atmScatteringUvwz(r, mu, muS, nu, rayIntersectsGround);
+        float texCoordX = uvwz.x * float(SCATTERING_TEXTURE_NU_SIZE - 1);
+        float texX = floor(texCoordX);
+        float lerp = texCoordX - texX;
+        vec3 uvw0 = vec3((texX + uvwz.y) / float(SCATTERING_TEXTURE_NU_SIZE), uvwz.z, uvwz.w);
+        vec3 uvw1 = vec3((texX + 1.0 + uvwz.y) / float(SCATTERING_TEXTURE_NU_SIZE), uvwz.z, uvwz.w);
+        vec4 combined = texture(scatteringTexture, uvw0) * (1.0 - lerp) +
+                        texture(scatteringTexture, uvw1) * lerp;
+        singleMie = atmExtrapolateSingleMie(combined);
+        return vec3(combined.rgb);
+      }
+
+      // ---- 辐照度 LUT（2D：mu_s × r）----
+      vec3 atmIrradiance(float r, float muS) {
+        float xR = (r - ATM_BOTTOM_RADIUS) / (ATM_TOP_RADIUS - ATM_BOTTOM_RADIUS);
+        float xMuS = muS * 0.5 + 0.5;
+        vec2 uv = vec2(atmTextureCoordFromUnitRange(xMuS, IRRADIANCE_TEXTURE_WIDTH),
+                       atmTextureCoordFromUnitRange(xR, IRRADIANCE_TEXTURE_HEIGHT));
+        return vec3(texture(irradianceTexture, uv).rgb);
+      }
+
+      // ---- 太阳 + 天空辐照度（云的环境光就来自这儿）----
+      //
+      // 这是**余弦加权**版（源库的 GetSunAndSkyIrradiance）：
+      //   sun = solar × T_sun × max(dot(normal, sunDir), 0)
+      //   sky = Irradiance × (1 + dot(normal, point)/r) × 0.5
+      // 它描述的是「一个 Lambert 表面」收到的辐照度 —— 适合地面，不适合云。
+      vec3 atmSunAndSkyIrradiance(vec3 point, vec3 normal, vec3 sunDirection,
+                                  out vec3 skyIrradiance) {
+        float r = length(point);
+        float muS = dot(point, sunDirection) / r;
+        skyIrradiance = atmIrradiance(r, muS) * (1.0 + dot(normal, point) / r) * 0.5;
+        return ATM_SOLAR_IRRADIANCE * atmTransmittanceToSun(r, muS) *
+               max(dot(normal, sunDirection), 0.0);
+      }
+
+      /**
+       * ===== 修正：**标量**辐照度（源库的 GetSunAndSkyScalarIlluminance）=====
+       *
+       * 云不是表面，是**参与介质**：一个体积元从整个上半球各方向收光，
+       * 所以没有「法线」这回事，也就不该乘 cos 项。物理上正确的写法是对
+       * 上半球积分 —— 各向同性时正好等于「辐照度 × 2π」：
+       *
+       *   sun = solar_irradiance × T_sun          （无 cos 项）
+       *   sky = GetIrradiance(r, mu_s) × 2π
+       *
+       * 源库给云用的就是这个版本。
+       *
+       * 之前这里错用了余弦加权版、还把 normal 传成径向 shellDir，于是：
+       *   · 太阳光多乘一个 max(mu_s, 0) —— 正午 mu_s≈0.96 看不出，
+       *     黄昏 7° 时 mu_s≈0.12，云比源库暗约 8 倍，整片云发灰不暖；
+       *   · 天空光因 normal ∥ point 使 (1 + dot/r) 恒等于 2，再 ×0.5
+       *     就退化成 ×1.0，比源库弱 2π ≈ 6.28 倍 ——
+       *     这就是当初要拿 skyIrradianceScale = 4 去硬补的原因。
+       */
+      vec3 atmSunAndSkyScalarIrradiance(vec3 point, vec3 sunDirection,
+                                        out vec3 skyIrradiance) {
+        float r = length(point);
+        float muS = dot(point, sunDirection) / r;
+        skyIrradiance = atmIrradiance(r, muS) * 2.0 * ATM_PI;
+        return ATM_SOLAR_IRRADIANCE * atmTransmittanceToSun(r, muS);
+      }
+
+      // ---- 相机到某点的天空辐亮度（空气透视 + 光束都在这里）----
+      vec2 atmRaySphereIntersections(vec3 camera, vec3 direction, float radius) {
+        float b = 2.0 * dot(direction, camera);
+        float c = dot(camera, camera) - radius * radius;
+        float discriminant = b * b - 4.0 * c;
+        float Q = sqrt(max(discriminant, 0.0));
+        return vec2(-b - Q, -b + Q) * 0.5;
+      }
+      vec3 atmClosestPointOnRay(vec3 camera, vec3 point) {
+        vec3 ray = point - camera;
+        float t = clamp(-dot(camera, ray) / dot(ray, ray), 0.0, 1.0);
+        return camera + t * ray;
+      }
+      bool atmClipAtBottom(vec3 viewRay, inout vec3 camera, inout vec3 point) {
+        float rCamera = length(camera);
+        float rPoint = length(point);
+        bool cameraBelow = rCamera < ATM_BOTTOM_RADIUS;
+        bool pointBelow = rPoint < ATM_BOTTOM_RADIUS;
+        vec2 t = atmRaySphereIntersections(camera, viewRay, ATM_BOTTOM_RADIUS);
+        vec3 intersection = camera + viewRay * (cameraBelow ? t.y : t.x);
+        camera = cameraBelow ? intersection : camera;
+        point = pointBelow ? intersection : point;
+        return cameraBelow && pointBelow;
+      }
+
+      /**
+       * 相机 → point 这段路径上，大气贡献了多少散射光。
+       *
+       * shadow_length 是「被云挡掉的那一段长度」：只让**没被挡**的那部分
+       * 产生散射 —— 云缝里的光柱就是这么来的。
+       */
+      vec3 atmSkyRadianceToPoint(vec3 camera, vec3 point, float shadowLength,
+                                 vec3 sunDirection, out vec3 transmittance) {
+        if (length(atmClosestPointOnRay(camera, point)) > ATM_TOP_RADIUS) {
+          transmittance = vec3(1.0);
+          return vec3(0.0);
+        }
+        vec3 viewRay = normalize(point - camera);
+        if (atmClipAtBottom(viewRay, camera, point)) {
+          transmittance = vec3(1.0);
+          return vec3(0.0);
+        }
+        float r = length(camera);
+        float rmu = dot(camera, viewRay);
+        float distToTop = -rmu - atmSafeSqrt(rmu * rmu - r * r + ATM_TOP_RADIUS * ATM_TOP_RADIUS);
+        if (distToTop > 0.0) {
+          camera = camera + viewRay * distToTop;
+          r = ATM_TOP_RADIUS;
+          rmu += distToTop;
+        }
+        float mu = rmu / r;
+        float muS = dot(camera, sunDirection) / r;
+        float nu = dot(viewRay, sunDirection);
+        float d = length(point - camera);
+        bool hitsGround = atmRayIntersectsGround(r, mu);
+        if (!hitsGround) {
+          float muHorizon = -atmSafeSqrt(1.0 - (ATM_BOTTOM_RADIUS * ATM_BOTTOM_RADIUS) / (r * r));
+          mu = max(mu, muHorizon + 0.004);
+        }
+        transmittance = atmTransmittance(r, mu, d, hitsGround);
+
+        vec3 singleMie;
+        vec3 scattering = atmCombinedScattering(r, mu, muS, nu, hitsGround, singleMie);
+
+        d = max(d - shadowLength, 0.0);
+        float rP = atmClampRadius(sqrt(d * d + 2.0 * r * mu * d + r * r));
+        float muP = (r * mu + d) / rP;
+        float muSP = (r * muS + d * nu) / rP;
+        vec3 singleMieP;
+        vec3 scatteringP = atmCombinedScattering(rP, muP, muSP, nu, hitsGround, singleMieP);
+
+        vec3 shadowTransmittance = transmittance;
+        if (shadowLength > 0.0) {
+          shadowTransmittance = atmTransmittance(r, mu, d, hitsGround);
+        }
+        vec3 higherOrder = atmGetScattering(higherOrderScatteringTexture,
+                                            r, mu, muS, nu, hitsGround);
+        vec3 singleScattering = scattering - higherOrder;
+        vec3 higherOrderP = atmGetScattering(higherOrderScatteringTexture,
+                                             rP, muP, muSP, nu, hitsGround);
+        vec3 singleScatteringP = scatteringP - higherOrderP;
+
+        scattering = singleScattering - shadowTransmittance * singleScatteringP +
+                     higherOrder - transmittance * higherOrderP;
+        singleMie = singleMie - shadowTransmittance * singleMieP;
+        singleMie = atmExtrapolateSingleMie(vec4(scattering, singleMie.r));
+        singleMie = singleMie * smoothstep(0.0, 0.01, muS);
+
+        return scattering * atmRayleighPhase(nu) +
+               singleMie * atmMiePhase(ATM_MIE_PHASE_FUNCTION_G, nu);
+      }
+
+      // 亮度版包装（源库给云着色器调的就是这个）
+      vec3 atmSkyLuminanceToPoint(vec3 camera, vec3 point, float shadowLength,
+                                  vec3 sunDirection, out vec3 transmittance) {
+        return atmSkyRadianceToPoint(camera, point, shadowLength, sunDirection, transmittance) *
+               SKY_SPECTRAL_RADIANCE_TO_LUMINANCE;
+      }
+      // ===== 修正：改用**标量**辐照度（对齐源库）=====
+      // 云是参与介质，收的是整个上半球的光，没有 cos 项。
+      vec3 atmSunAndSkyIlluminance(vec3 point, vec3 sunDirection,
+                                   out vec3 skyIrradiance, float skyScale) {
+        vec3 sunIrradiance =
+          atmSunAndSkyScalarIrradiance(point, sunDirection, skyIrradiance);
+        skyIrradiance *= SKY_SPECTRAL_RADIANCE_TO_LUMINANCE * skyScale;
+        return sunIrradiance * SUN_SPECTRAL_RADIANCE_TO_LUMINANCE;
+      }
+
+      // ===== 修正：曝光 + 色调映射（对齐源库 ResolvePass）=====
+      // 云层 Pass 输出的 rgb 是**预乘过不透明度**的线性辐射亮度，
+      // 这里要先还原成直色、乘曝光、过色调曲线，最后再乘回不透明度。
+      uniform float u_exposure;
+      uniform float u_cloudContrast;
+
+      // Khronos PBR Neutral —— 和 Cesium 自己用的那条曲线一致。
+      // 用它才不会在「云 / 天空」交界处留一条接缝。
+      vec3 pbrNeutralToneMapping(vec3 color) {
+        const float startCompression = 0.8 - 0.04;
+        const float desaturation = 0.15;
+        float x = min(color.r, min(color.g, color.b));
+        float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+        color -= offset;
+        float peak = max(color.r, max(color.g, color.b));
+        if (peak < startCompression) {
+          return color;
+        }
+        float d = 1.0 - startCompression;
+        float newPeak = 1.0 - d * d / (peak + d - startCompression);
+        color *= newPeak / peak;
+        float g = 1.0 - 1.0 / (desaturation * (peak - newPeak) + 1.0);
+        return mix(color, newPeak * vec3(1.0), g);
+      }
+
+      /**
+       * 把「预乘的线性云辐射」送到**显示空间**，返回仍是预乘形式。
+       *
+       * ⚠️ 顺序不能变：
+       *   ① ÷α       —— 预乘还原成直色，后面的非线性操作必须作用在直色上
+       *   ② × 曝光    —— 线性空间里乘
+       *   ③ pow(对比) —— 曲线之前提/压暗部（<1 变柔，>1 变硬）
+       *   ④ 色调映射   —— PBR Neutral 压高光
+       *   ⑤ inverseGamma —— Cesium 的场景色已经 gamma 编码过，云要跟上
+       *   ⑥ × α       —— 乘回预乘形式，才能和场景色直接相加
+       */
+      vec3 encodeCloudForDisplay(vec3 premultipliedRadiance, float alpha) {
+        if (alpha <= 1e-6) {
+          return vec3(0.0);
+        }
+        vec3 radiance = premultipliedRadiance / alpha;
+        radiance *= u_exposure;
+        radiance = pow(max(radiance, 0.0), vec3(u_cloudContrast));
+        radiance = pbrNeutralToneMapping(radiance);
+        return czm_inverseGamma(max(radiance, 0.0)) * alpha;
+      }
+
+void main() {
+  vec2 uv = v_textureCoordinates;
+  vec4 sceneColor = texture(colorTexture, uv);
+
+  // —— 1. 地面云影 ——
+  // 云影是乘在**场景颜色**上的，所以必须在这一层做。
+  vec2 ndc = uv * 2.0 - 1.0;
+  vec3 rayDir = normalize(
+    u_cameraDirection +
+    u_cameraRight * (ndc.x * u_tanHalfFov.x) +
+    u_cameraUp    * (ndc.y * u_tanHalfFov.y)
+  );
+  vec3 sceneShadowed = sceneColor.rgb;
+  applyGroundShadow(sceneShadowed, u_cameraPositionSphere, rayDir);
+
+  // 调试：直接看累积缓冲
+  if (u_temporalDebug > 1.5) {
+    out_FragColor = vec4(texture(historyBuffer, uv).rgb, 1.0);
+    return;
+  }
+
+  // —— 2. 取云层：开累积看历史，关累积看本帧低分辨率原图 ——
+  vec4 cloud = (u_temporalEnabled > 0.5 && u_temporalDebug < 0.5)
+    ? texture(historyBuffer, uv)
+    : texture(cloudBuffer, uv);
+
+  // —— 3. 合成 ——
+  // ===== 修正：云要先送到显示空间，再和场景色相加 =====
+  // 场景色 sceneColor 已经被 Cesium 色调映射 + gamma 编码过了；
+  // 云层缓冲里还是**线性**的预乘辐射。两者直接相加会：
+  //   · 高光切白（没有曲线压）；
+  //   · 云和天空之间留一条接缝（两条不同的传递函数）。
+  // 所以这里先用 encodeCloudForDisplay 把云走一遍和 Cesium 相同的显示变换。
+  //
+  // 空气透视和光束不在这里做 —— 它们在云层 Pass 里算，
+  // 因为只有那里才知道「云的前表面」有多远。
+  vec3 cloudDisplay = encodeCloudForDisplay(cloud.rgb, cloud.a);
+
+  out_FragColor = vec4(sceneShadowed * (1.0 - cloud.a) + cloudDisplay, sceneColor.a);
+}
+`;
+
+      createApp({
+        data() {
+          return {
+            viewer: null,
+            imageryLayer: null,
+            cloudStage: null,
+            shadowStage: null,
+            cloudComposite: null,
+            tileset: null,
+            statusText: "",
+            scratch: {},
+            // ===== 本篇新增：时间累积的运行时状态 =====
+            // 这些是 GPU 对象，用 Vue.markRaw 包一层逃开响应式代理 ——
+            // 让 Proxy 去包 Cesium 的 Texture/Framebuffer 是自找麻烦。
+            history: null,        // { read, write } 两张全分辨率累积缓冲
+            temporalPass: null,   // 把「本帧云层」混进累积缓冲的那个 Pass
+            resolveStage: null,   // 把累积结果合成到屏幕的 PostProcessStage
+            frameIndex: 0,        // 帧号，Bayer 相位靠它循环
+            prevCam: null,        // 上一帧的相机基底，重投影要用
+            resetHistory: true,   // 置位时这一帧不做混合，直接把当前帧写进历史
+            // ===== 本篇新增：两张预计算的 3D 噪声纹理 =====
+            volumeTextures: {
+              shape: null, shapeDetail: null, weather: null, turbulence: null,
+              stbn: null,   // ===== 本篇新增：时空蓝噪声 =====
+              // ===== 本篇新增：大气 LUT（4 张）=====
+              atmosphere: { transmittance: null, irradiance: null, scattering: null, higherOrder: null },
+            },
+            params: {
+              // 云层
+              baseHeight: 1200,
+              thickness: 1800,
+              densityScale: 1.0,
+              coverage: 0.40,
+              cloudColor: "#ffffff",
+              // 步进
+              stepCount: 64,
+              maxDistance: 40000,
+              // ===== 本篇新增：形状 =====
+              shapeAmount: 1.0,
+              shapeRepeat: 0.00003,
+              shapeDetailAmount: 0.35,
+              shapeDetailRepeat: 0.003,
+              shapeAlteringBias: 0.35,
+              profileLinear: 0.75,
+              profileConstant: 0.25,
+              // ===== 本篇新增：场景遮挡 =====
+              depthTest: true,
+              occlusionBandScale: 0.02,
+              debugSceneDepth: false,
+              // ===== 本篇新增：光照 =====
+              lightingEnabled: true,
+              sunColor: "#fff7e8",
+              skyColor: "#dbeeff",
+              skyLightScale: 1.0,
+              extinction: 0.003,
+              albedo: 1.0,
+              powderScale: 0.8,
+              powderExponent: 150,
+              multiScatterOctaves: 8,
+              // ===== 修正：曝光与色调映射移到 RESOLVE =====
+              // 曝光现在作用在**整个云层**（含空气透视的 in-scatter）上，
+              // 后面还跟了 pow(对比度) → PBR Neutral → inverseGamma 一条曲线。
+              //
+              // 取值说明：源库默认 6.0，但那是配它自己那套云参数
+              // （三层、extinction = density × 1.0）调出来的。
+              // 本 demo 的 extinction = density × 0.003、只有一层，
+              // 实测 4.0 时正午的整体亮度才和改之前对得上（不会发白）。
+              // 想更接近源库就调到 6。
+              exposure: 4.0,
+              cloudContrast: 0.8,      // 色调曲线前的对比度：<1 提暗部变柔，>1 变硬
+              sunStepCount: 6,
+              sunStepSize: 40,
+              sunStepScale: 2.0,
+              lightDebug: 0,
+              timePreset: "正午 12:00",
+              // ===== 本篇新增：天气与风 =====
+              useWeatherTexture: true,  // 关掉 = 天气恒为 1，回到第 4 篇的均匀云层
+              windDirection: 90,        // 风向（度）
+              windSpeed: 18,            // 风速（m/s）
+              // ⚠️ 这一项不是物理参数，是「演示用的时间倍率」。
+              //
+              // 真实风速下云有多慢？18 m/s 的风，一分钟走 1.08 km。
+              // 而决定云「轮廓」的形状纹理只按风速的 30% 走（5.4 m/s），
+              // 换算到屏幕上 —— 30 km 外的云，一分钟才挪 8.5 个像素。
+              // 盯着看半分钟，会以为云根本没动。
+              //
+              // 所以这里把风的「时钟」拨快。默认 10 倍：
+              // 一分钟能看到 85 px 的位移，是「延时摄影」的观感。
+              // 调回 1 就是严格实时。
+              windTimeScale: 10,
+              // 50 平铺：一张天气图的格子约 400 km，
+              // 屏幕上能同时看到好几团云和它们的间隙。
+              // 调到 6 会变成 3000 km 一格，整屏都在同一团云里，
+              // 看起来就是「均匀的一片白」；
+              // 调到 100 则格子只有 200 km，云碎成一颗颗小疙瘩。
+              weatherRepeat: 50,        // 天气图平铺次数
+              weatherExponent: 1.0,     // 天气值指数
+              turbulenceRepeat: 20,     // 湍流平铺次数
+              turbulenceDisplacement: 350,  // 湍流位移（米）
+              // ===== 本篇新增：云影 =====
+              shadowsEnabled: true,     // 关掉就回到第 5 篇（没有阴影）
+              shadowCascadeCount: 3,    // 级联数量
+              cascadeSize1: 8000,       // 级联 1 覆盖边长（米）
+              cascadeSize2: 32000,      // 级联 2
+              cascadeSize3: 128000,     // 级联 3
+              shadowStepCount: 24,      // 阴影图每根光线走多少步
+              shadowMaxDistance: 40000, // 阴影光线最远走多远
+              shadowMinDensity: 0.01,   // 低于这个密度不算「有云」
+              shadowIntensity: 1.0,     // 云影强度
+              shadowBlur: 1.5,          // PCF 半径（纹素）
+              castShadowOnScene: true,  // 把云影投到地面
+              shadowOnSceneIntensity: 0.7,
+              shadowDebug: 0,           // 0=关 1=地面阴影 2=阴影图集
+              // ===== 本篇新增：时间累积 =====
+              temporalEnabled: true,    // 关掉 = 噪点原样呈现（对比用）
+              renderScale: 0.5,        // 云层按这个比例渲染：1 / 0.5 / 0.25
+              temporalAlpha: 0.12,      // 本帧权重 α，越小历史越重、越平滑
+              varianceGamma: 2.0,       // 方差裁剪 γ，防鬼影
+              jitterEnabled: true,      // 关掉 = 回到「有条带」的样子
+              stbnEnabled: true,        // 用时空蓝噪声当步进相位（关掉退回 Bayer）
+              temporalDebug: 0,         // 0=关 1=只看本帧 2=只看累积缓冲
+              // ===== 本篇新增：大气 =====
+              atmosphereEnabled: true,  // 关掉 = 回到第 7 篇（常量太阳色/天空色）
+              sunIrradianceScale: 1.0,  // 太阳辐照度倍率
+              // ===== 修正：改回 1.0 =====
+              // 之前写 4.0 是为了补「天空光比源库弱 2π 倍」的窟窿。
+              // 现在辐照度换成标量版（× 2π），这个补偿就不需要了 ——
+              // 留着 4.0 会让环境光反而比源库亮 4 倍、云发白发平。
+              skyIrradianceScale: 1.0,  // 天空辐照度倍率
+              // 空气透视的终点用**云的前表面**（和源库一致），不算到地面。
+              // 算到地面的话路径长 5 倍，透射率掉到 0.8/0.6，整幅画面被压暗偏红。
+              // ⚠️ 效果依赖视角：相机在云层**上方**时几乎看不见，
+              //    要切「云下仰视（800 m）」朝太阳看才明显。
+              aerialPerspective: true,  // 空气透视（远处按距离混进大气散射）
+              lightShafts: true,        // 光束（只让没被云挡住的那段产生散射）
+              aerialScale: 1.0,         // 空气透视强度（只缩放 in-scatter）
+              // 源库不做这个色相修正，默认关。正午仍偏橙时再打开。
+              inscatterHueFix: false,
+              atmoDebug: 0,             // 临时调试：1=太阳辐照度 2=天空辐照度
+            },
+          };
+        },
+        async mounted() {
+          this.initMap();
+          this.loadTileset();
+          // ===== 本篇新增：3D 噪声纹理必须先就绪，再挂后处理 =====
+          await this.loadNoiseTextures();
+          this.addClouds();
+          this.addlilgui();
+        },
+        beforeUnmount() {
+          // ===== 本篇新增：摘掉 postRender 回调 + 释放 GPU 资源 =====
+          if (this._postRenderRemover) {
+            this._postRenderRemover();
+            this._postRenderRemover = null;
+          }
+          this.disposeAll();
+          if (this.myLilGui) {
+            this.myLilGui.destroy();
+            this.myLilGui = null;
+          }
+        },
+        methods: {
+          initMap() {
+            // ===== 本篇新增：固定起始时间 =====
+            // 不指定的话，页面在夜里打开就是一片黑云。
+            // 而且 viewer 会在构造后用自己的 clock 覆盖 currentTime，
+            // 所以必须**在构造时**就把 clockViewModel 传进去。
+            const startTime = Cesium.JulianDate.fromIso8601("2026-06-21T04:00:00Z");
+            const clock = new Cesium.Clock({
+              currentTime: Cesium.JulianDate.clone(startTime),
+              startTime: Cesium.JulianDate.addDays(startTime, -1, new Cesium.JulianDate()),
+              stopTime: Cesium.JulianDate.addDays(startTime, 1, new Cesium.JulianDate()),
+              clockRange: Cesium.ClockRange.LOOP_STOP,
+              shouldAnimate: true,
+              multiplier: 20,
+            });
+
+            let viewer = new Cesium.Viewer("cesiumContainer", {
+              // ===== 本篇新增：时间轴 =====
+              // 光照完全由太阳方向决定，所以「时间」本身就是这个 demo 的一个参数。
+              // 打开时间轴，读者才能亲手把太阳拖到不同位置看云的明暗变化。
+              // （前 3 篇没有光照，时间无关，所以不开。）
+              //
+              // ⚠️ 只改这两行的值，不要再往上加一份 timeline/animation ——
+              // 对象字面量里重复的 key 是**后者覆盖前者**，
+              // 上面写了 true、下面还留着 false 的话，等于没开。
+              clockViewModel: new Cesium.ClockViewModel(clock),
+              baseLayer: false,
+              animation: true,
+              timeline: true,
+              fullscreenButton: false,
+              infoBox: false,
+              geocoder: false,
+              homeButton: false,
+              sceneModePicker: false,
+              baseLayerPicker: false,
+              navigationHelpButton: false,
+              selectionIndicator: false,
+              shouldAnimate: true,
+            });
+
+            window.viewer = viewer;
+            // viewer.scene.debugShowFramesPerSecond = true;
+            viewer.scene.globe.enableLighting = true;
+            viewer.scene.fog.enabled = true;
+            viewer.scene.skyAtmosphere.show = true;
+            viewer._cesiumWidget._creditContainer.style.display = "none";
+
+            let imageryLayer = viewer.imageryLayers.addImageryProvider(
+              new Cesium.UrlTemplateImageryProvider({
+                url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                maximumLevel: 18,
+              }),
+            );
+
+            this.viewer = viewer;
+            this.imageryLayer = imageryLayer;
+
+            // 相机放在云层之上，略微俯视 —— 能同时看到云顶和地平线
+            viewer.camera.setView({
+              destination: Cesium.Cartesian3.fromDegrees(116.4, 39.9, 7000),
+              orientation: {
+                heading: Cesium.Math.toRadians(0),
+                pitch: Cesium.Math.toRadians(-17),
+                roll: 0,
+              },
+            });
+            return viewer;
+          },
+          async loadTileset() {
+            try {
+              this.statusText = "正在加载 3D Tiles 白模…";
+              this.tileset = await Cesium.Cesium3DTileset.fromUrl(
+                "../data/tileset/baimo/tileset.json",
+                {
+                  maximumScreenSpaceError: 16,
+                  maximumMemoryUsage: 2048,
+                },
+              );
+              this.viewer.scene.primitives.add(this.tileset);
+              await this.viewer.zoomTo(this.tileset);
+              this.statusText = "模型加载完成。";
+            } catch (error) {
+              console.warn("3D Tiles 加载失败：", error);
+              this.statusText = `3D Tiles 加载失败：${error.message}`;
+            }
+          },
+
+          /**
+           * 每帧算一次「云壳球心」。
+           *
+           * 这个球要满足：半径固定为 BOTTOM_RADIUS，且与椭球在**相机的地面投影点**
+           * 处相切。所以球心 = 地面点 - 法线 * BOTTOM_RADIUS。
+           *
+           * 直观理解：球心会落在离地心很近的地方，整个球几乎是「以地心为球心、
+           * 半径 6360km」的一个球，只是沿法线挪了一点，好让球面正好压在地面点上。
+           * 这样云层高度就永远相对「脚下的地面」来算。
+           */
+          computeSphereCenter() {
+            const s = this.scratch;
+            const ellipsoid = this.viewer.scene.globe.ellipsoid;
+            const cameraPosition = this.viewer.camera.positionWC;
+
+            if (!s.carto) s.carto = new Cesium.Cartographic();
+            if (!s.surface) s.surface = new Cesium.Cartesian3();
+            if (!s.normal) s.normal = new Cesium.Cartesian3();
+            if (!s.center) s.center = new Cesium.Cartesian3();
+
+            const carto = Cesium.Cartographic.fromCartesian(
+              cameraPosition,
+              ellipsoid,
+              s.carto,
+            );
+            carto.height = 0;
+            const surface = Cesium.Cartographic.toCartesian(
+              carto,
+              ellipsoid,
+              s.surface,
+            );
+            const normal = ellipsoid.geodeticSurfaceNormal(surface, s.normal);
+
+            const center = Cesium.Cartesian3.multiplyByScalar(
+              normal,
+              BOTTOM_RADIUS,
+              s.center,
+            );
+            Cesium.Cartesian3.subtract(surface, center, center);
+
+            // 相对相机的位置（球坐标系里的相机位置 = 球心 - 相机位置 取反）
+            const centerRelative = Cesium.Cartesian3.subtract(
+              center,
+              cameraPosition,
+              s.centerRelative || (s.centerRelative = new Cesium.Cartesian3()),
+            );
+            return Cesium.Cartesian3.negate(
+              centerRelative,
+              s.cameraPositionSphere ||
+                (s.cameraPositionSphere = new Cesium.Cartesian3()),
+            );
+          },
+
+          /**
+           * ===== 本篇新增 =====
+           * 求「指向太阳」的单位向量（ECEF）。
+           *
+           * 先用 Simon1994 算出太阳在**惯性系**里的位置，
+           * 再用 computeIcrfToFixedMatrix 转到**地固系**。
+           *
+           * 云壳坐标系只是把地固系平移了一下，方向不变，
+           * 所以这个向量可以直接拿到着色器里用。
+           */
+          /**
+           * ===== 本篇新增 =====
+           * 跳到指定时间。
+           *
+           * 注意用 clockViewModel 而不是 viewer.clock ——
+           * viewer 的 clock 是受 view model 驱动的，直接改会被覆盖回去。
+           */
+          setTime(iso) {
+            if (!this.viewer) return;
+            this.viewer.clockViewModel.currentTime =
+              Cesium.JulianDate.fromIso8601(iso);
+          },
+
+          /** 把 #rrggbb 转成 vec3（0~1），给 vec3 uniform 用 */
+          hexToVec3(hex) {
+            const c = Cesium.Color.fromCssColorString(hex);
+            if (!this._vec3Cache) this._vec3Cache = {};
+            const k = hex;
+            if (!this._vec3Cache[k]) this._vec3Cache[k] = new Cesium.Cartesian3();
+            this._vec3Cache[k].x = c.red;
+            this._vec3Cache[k].y = c.green;
+            this._vec3Cache[k].z = c.blue;
+            return this._vec3Cache[k];
+          },
+
+          computeSunDirection() {
+            const s = this.scratch;
+            if (!s.sunPos) s.sunPos = new Cesium.Cartesian3();
+            if (!s.icrf) s.icrf = new Cesium.Matrix3();
+
+            const time = this.viewer.clock.currentTime;
+            Cesium.Simon1994PlanetaryPositions.computeSunPositionInEarthInertialFrame(
+              time, s.sunPos,
+            );
+            const m = Cesium.Transforms.computeIcrfToFixedMatrix(time, s.icrf);
+            if (Cesium.defined(m)) {
+              Cesium.Matrix3.multiplyByVector(m, s.sunPos, s.sunPos);
+            }
+            return Cesium.Cartesian3.normalize(s.sunPos, s.sunPos);
+          },
+
+          /**
+           * ===== 本篇新增 =====
+           * 加载预计算的 3D 噪声纹理。
+           *
+           * 两个 .bin 都是**裸 R8 数据**，没有文件头：
+           *   shape.bin        128³ = 2,097,152 字节
+           *   shape_detail.bin  32³ =    32,768 字节
+           *
+           * 用 Cesium.Texture3D 上传，着色器里用 sampler3D 采样，
+           * 三线性插值由硬件做。wrapS/T/R 全设 REPEAT，噪声才能无限平铺。
+           */
+          /**
+           * ===== 本篇新增：加载大气 LUT =====
+           * 4 个 .bin 都是 RGBA16F 的裸数据（离线预计算好的），
+           * 直接按半浮点上传就行，不需要任何解码。
+           */
+          async loadAtmosphereLut(url, width, height, depth) {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`${url} 加载失败：HTTP ${res.status}`);
+            const bytes = new Uint8Array(await res.arrayBuffer());
+            const texels = width * height * (depth || 1);
+            const expected = texels * 8;   // RGBA × 半浮点 = 8 字节
+            if (bytes.length !== expected) {
+              throw new Error(`${url} 大小不对：期望 ${expected}，实际 ${bytes.length}`);
+            }
+            const data = new Uint16Array(bytes.buffer, bytes.byteOffset, texels * 4);
+            const common = {
+              context: this.viewer.scene.context,
+              width,
+              height,
+              pixelFormat: Cesium.PixelFormat.RGBA,
+              pixelDatatype: Cesium.PixelDatatype.HALF_FLOAT,
+              flipY: false,
+              sampler: new Cesium.Sampler({
+                minificationFilter: Cesium.TextureMinificationFilter.LINEAR,
+                magnificationFilter: Cesium.TextureMagnificationFilter.LINEAR,
+                wrapS: Cesium.TextureWrap.CLAMP_TO_EDGE,
+                wrapT: Cesium.TextureWrap.CLAMP_TO_EDGE,
+                wrapR: Cesium.TextureWrap.CLAMP_TO_EDGE,
+              }),
+            };
+            if (depth) {
+              return new Cesium.Texture3D(Object.assign({
+                depth,
+                source: { width, height, depth, arrayBufferView: data },
+              }, common));
+            }
+            return new Cesium.Texture(Object.assign({
+              source: { width, height, arrayBufferView: data },
+            }, common));
+          },
+
+          async loadVolumeTexture(url, size, height = size, depth = size) {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`${url} 加载失败：HTTP ${res.status}`);
+            const data = new Uint8Array(await res.arrayBuffer());
+            const expected = size * height * depth;
+            if (data.length !== expected) {
+              throw new Error(`${url} 大小不对：期望 ${expected}，实际 ${data.length}`);
+            }
+            return new Cesium.Texture3D({
+              context: this.viewer.scene.context,
+              width: size,
+              height,
+              depth,
+              pixelFormat: Cesium.PixelFormat.RED,
+              pixelDatatype: Cesium.PixelDatatype.UNSIGNED_BYTE,
+              flipY: false,
+              sampler: new Cesium.Sampler({
+                minificationFilter: Cesium.TextureMinificationFilter.LINEAR,
+                magnificationFilter: Cesium.TextureMagnificationFilter.LINEAR,
+                wrapS: Cesium.TextureWrap.REPEAT,
+                wrapT: Cesium.TextureWrap.REPEAT,
+                wrapR: Cesium.TextureWrap.REPEAT,
+              }),
+              source: { width: size, height, depth, arrayBufferView: data },
+            });
+          },
+
+          /**
+           * ===== 本篇新增 =====
+           * 把 PNG 加载成 Cesium 的 2D 纹理。
+           * 天气图和湍流图都是普通图片，走 Cesium.Texture 上传即可。
+           */
+          async loadImageTexture(url) {
+            const img = new Image();
+            img.crossOrigin = "anonymous";
+            img.src = url;
+            await img.decode();
+            return new Cesium.Texture({
+              context: this.viewer.scene.context,
+              source: img,
+              sampler: new Cesium.Sampler({
+                minificationFilter: Cesium.TextureMinificationFilter.LINEAR,
+                magnificationFilter: Cesium.TextureMagnificationFilter.LINEAR,
+                wrapS: Cesium.TextureWrap.REPEAT,
+                wrapT: Cesium.TextureWrap.REPEAT,
+              }),
+            });
+          },
+
+          /**
+           * ===== 本篇新增 =====
+           * 风。一个方法算三组偏移，单位都不一样，别混：
+           *
+           *   weatherOffset     UV 单位 —— 除以 2e7 把米换算成 UV
+           *   shapeOffset       直接乘 shapeRepeat，等价于「形状图滑过多少个自身」
+           *   shapeDetailOffset 同理，但系数是 0.2（比形状慢一点，做视差）
+           *
+           * 为什么形状偏移不用除 2e7？
+           *   因为形状纹理的采样是 position * shapeRepeat，
+           *   位置单位是米，乘完 shapeRepeat 才是 UV。
+           *   所以要让纹理在 UV 空间里移动 d 米，偏移量就是 d * shapeRepeat。
+           *
+           * 系数 0.3 / 0.2 是源库给的：云整体随风走，但内部结构走得慢一些。
+           * 全用 1.0 的话，云会像贴纸一样整体平移，反而假。
+           */
+          windOffsets() {
+            const p = this.params;
+            if (!this._wind) {
+              this._wind = {
+                weather: new Cesium.Cartesian2(),
+                shape: new Cesium.Cartesian3(),
+                shapeDetail: new Cesium.Cartesian3(),
+              };
+            }
+            if (!this._t0) this._t0 = performance.now();
+
+            // 风的「时钟」。windTimeScale 只是把秒数放大，
+            // 不改变风的物理 —— 调回 1 就是严格实时。
+            const seconds =
+              ((performance.now() - this._t0) / 1000) * p.windTimeScale;
+            const distance = p.windSpeed * seconds;          // 风走了多少米
+            const rad = Cesium.Math.toRadians(p.windDirection);
+            const cx = Math.cos(rad) * distance;
+            const cy = Math.sin(rad) * distance;
+
+            // ① 天气图：米 → UV
+            const wScale = p.weatherRepeat / 2.0e7;
+            this._wind.weather.x = cx * wScale;
+            this._wind.weather.y = cy * wScale;
+
+            // ② 形状：米 → 纹理自身单位（乘 shapeRepeat）
+            //    z 分量是「原地翻涌」，跟水平风无关，给个固定速率
+            this._wind.shape.x = cx * p.shapeRepeat * 0.3;
+            this._wind.shape.y = cy * p.shapeRepeat * 0.3;
+            this._wind.shape.z = seconds * 0.2 * p.shapeRepeat;
+
+            // ③ 细节：走得更慢，制造视差
+            this._wind.shapeDetail.x = cx * p.shapeDetailRepeat * 0.2;
+            this._wind.shapeDetail.y = cy * p.shapeDetailRepeat * 0.2;
+
+            return this._wind;
+          },
+
+          async loadNoiseTextures() {
+            try {
+              const [shape, shapeDetail, weather, turbulence, stbn] = await Promise.all([
+                this.loadVolumeTexture("./data/clouds/shape.bin", 128),
+                this.loadVolumeTexture("./data/clouds/shape_detail.bin", 32),
+                this.loadImageTexture("./data/clouds/local_weather.png"),
+                this.loadImageTexture("./data/clouds/turbulence.png"),
+                // ===== 本篇新增：时空蓝噪声 128×128×64（Z 轴 = 时间切片）=====
+                this.loadVolumeTexture("./data/clouds/stbn.bin", 128, 128, 64),
+              ]);
+              this.volumeTextures.shape = shape;
+              this.volumeTextures.shapeDetail = shapeDetail;
+              this.volumeTextures.weather = weather;
+              this.volumeTextures.turbulence = turbulence;
+              this.volumeTextures.stbn = stbn;
+
+              // ===== 本篇新增：大气 LUT =====
+              // 尺寸必须和离线预计算时一致，改了就全错位
+              const [transmittance, irradiance, scattering, higherOrder] = await Promise.all([
+                this.loadAtmosphereLut("./data/clouds/atmosphere/transmittance.bin", 256, 64),
+                this.loadAtmosphereLut("./data/clouds/atmosphere/irradiance.bin", 64, 16),
+                this.loadAtmosphereLut("./data/clouds/atmosphere/scattering.bin", 256, 128, 32),
+                this.loadAtmosphereLut("./data/clouds/atmosphere/higher_order_scattering.bin", 256, 128, 32),
+              ]);
+              this.volumeTextures.atmosphere.transmittance = transmittance;
+              this.volumeTextures.atmosphere.irradiance = irradiance;
+              this.volumeTextures.atmosphere.scattering = scattering;
+              this.volumeTextures.atmosphere.higherOrder = higherOrder;
+              console.log("[体积云02] 噪声纹理就绪", {
+                shape: shape.width + "³",
+                shapeDetail: shapeDetail.width + "³",
+              });
+            } catch (e) {
+              console.error("[体积云02] 噪声纹理加载失败：", e);
+            }
+          },
+
+          /**
+           * ===== 本篇新增 =====
+           * 密度场相关的 uniform —— 两个 pass 共用一份。
+           *
+           * 阴影图和主画面必须用完全相同的密度场，否则云影会和云对不上。
+           * 与其抄两遍，不如写成一个方法，两边都 spread 进去。
+           */
+          densityUniforms() {
+            const p = this.params;
+            return {
+              u_bottomRadius: () => BOTTOM_RADIUS,
+              u_minHeight: () => p.baseHeight,
+              u_maxHeight: () => p.baseHeight + p.thickness,
+              u_densityScale: () => p.densityScale,
+              u_coverage: () => p.coverage,
+
+              shapeTexture: () => this.volumeTextures.shape,
+              shapeDetailTexture: () => this.volumeTextures.shapeDetail,
+              u_shapeRepeat: () => p.shapeRepeat,
+              u_shapeDetailRepeat: () => p.shapeDetailRepeat,
+              u_shapeAmount: () => p.shapeAmount,
+              u_shapeDetailAmount: () => p.shapeDetailAmount,
+              u_shapeAlteringBias: () => p.shapeAlteringBias,
+              u_coverageFilterWidth: () => 0.6,
+              u_profileLinear: () => p.profileLinear,
+              u_profileConstant: () => p.profileConstant,
+
+              localWeatherTexture: () => this.volumeTextures.weather,
+              turbulenceTexture: () => this.volumeTextures.turbulence,
+              u_weatherRepeat: () => p.weatherRepeat,
+              u_weatherOffset: () => this.windOffsets().weather,
+              u_weatherExponent: () => p.weatherExponent,
+              u_useWeather: () => (p.useWeatherTexture ? 1 : 0),
+              u_turbulenceRepeat: () => p.turbulenceRepeat,
+              u_turbulenceDisplacement: () => p.turbulenceDisplacement,
+              u_shapeOffset: () => this.windOffsets().shape,
+              u_shapeDetailOffset: () => this.windOffsets().shapeDetail,
+
+              // 阴影 pass 也要用到的两项
+              u_sunDirection: () => this.computeSunDirection(),
+              u_extinction: () => p.extinction,
+
+              // 阴影图集的几何
+              u_cascadeSize: () => this.cascadeSizeVec(),
+              u_groundCenterSphere: () => this.computeGroundFrame().center,
+              u_eastDir: () => this.computeGroundFrame().east,
+              u_northDir: () => this.computeGroundFrame().north,
+            };
+          },
+
+          /**
+           * ===== 本篇新增 =====
+           * 三个级联的边长。用不到的级联填 0 ——
+           * 着色器里 `distH < size * 0.5` 对 0 永远不成立，
+           * 会自动跳过，不用额外写分支。
+           */
+          cascadeSizeVec() {
+            const p = this.params;
+            if (!this._cascadeSize) this._cascadeSize = new Cesium.Cartesian3();
+            const v = this._cascadeSize;
+            const n = Math.max(1, Math.min(3, Math.round(p.shadowCascadeCount)));
+            v.x = p.cascadeSize1;
+            v.y = n >= 2 ? p.cascadeSize2 : 0;
+            v.z = n >= 3 ? p.cascadeSize3 : 0;
+            return v;
+          },
+
+          /**
+           * ===== 本篇新增 =====
+           * 阴影图的局部坐标系：以「相机正下方的地面点」为原点，
+           * 东为 x、北为 y。
+           *
+           * 为什么不用 ECEF？因为级联是「以相机为中心、一圈圈放大」的，
+           * 用相机脚下的局部坐标最自然，也省得每帧算一大堆矩阵。
+           *
+           * 返回的 center/east/north 都已经是**球坐标系**（减掉了云壳球心），
+           * 和着色器里的 positionSphere 在同一套坐标下。
+           */
+          computeGroundFrame() {
+            const viewer = this.viewer;
+            if (!this._groundFrame) {
+              this._groundFrame = {
+                center: new Cesium.Cartesian3(),
+                east: new Cesium.Cartesian3(),
+                north: new Cesium.Cartesian3(),
+                up: new Cesium.Cartesian3(),
+                surface: new Cesium.Cartesian3(),
+                sphereCenter: new Cesium.Cartesian3(),
+              };
+              this._groundCarto = new Cesium.Cartographic();
+            }
+            const g = this._groundFrame;
+            const c = this._groundCarto;
+            const camCarto = viewer.camera.positionCartographic;
+            c.longitude = camCarto.longitude;
+            c.latitude = camCarto.latitude;
+            c.height = 0;
+
+            // 地面点（ECEF）和它的法线
+            Cesium.Cartographic.toCartesian(c, Cesium.Ellipsoid.WGS84, g.surface);
+            Cesium.Ellipsoid.WGS84.geodeticSurfaceNormal(g.surface, g.up);
+
+            // 东 = up × Z轴；北 = 东 × up
+            Cesium.Cartesian3.cross(g.up, Cesium.Cartesian3.UNIT_Z, g.east);
+            Cesium.Cartesian3.normalize(g.east, g.east);
+            Cesium.Cartesian3.cross(g.east, g.up, g.north);
+            Cesium.Cartesian3.normalize(g.north, g.north);
+
+            // 换成球坐标系。
+            // ⚠️ computeSphereCenter() 返回的是「相机在球坐标系里的位置」，
+            //    不是球心本身 —— 球心 = 相机位置 - 它。
+            //    一开始直接拿地面点减了它，结果 groundCenter 模长只有 2 万米，
+            //    阴影图整个落在离地球 2 万米的地方，什么都采不到。
+            const cameraSphere = this.computeSphereCenter();
+            const camWC = viewer.camera.positionWC;
+            const sphereCenterECEF = Cesium.Cartesian3.subtract(
+              camWC, cameraSphere, g.sphereCenter);
+            Cesium.Cartesian3.subtract(g.surface, sphereCenterECEF, g.center);
+            return g;
+          },
+
+          addClouds() {
+            const viewer = this.viewer;
+            const p = this.params;
+
+            // ===== 本篇新增：阴影 Pass =====
+            this.shadowStage = new Cesium.PostProcessStage({
+              name: "cloudShadowMap",
+              fragmentShader: SHADOW_SHADER,
+              uniforms: Object.assign(this.densityUniforms(), {
+                u_shadowEnabled: () => (p.shadowsEnabled ? 1 : 0),
+                u_shadowCascadeCount: () => p.shadowCascadeCount,
+                u_shadowStepCount: () => p.shadowStepCount,
+                u_shadowMaxDistance: () => p.shadowMaxDistance,
+                u_shadowMinDensity: () => p.shadowMinDensity,
+              }),
+            });
+
+            // ===== 本篇新增：云层改成「降分辨率渲染」=====
+            // textureScale = 0.25 表示云只按 1/4 × 1/4 渲染，
+            // 像素数是全分辨率的 1/16 —— 这是本篇省算力的主要来源。
+            // pixelDatatype 用 HALF_FLOAT：累积要做多帧平均，
+            // 8 位纹理的量化误差会在平均里积成一条条色阶。
+            this.cloudStage = new Cesium.PostProcessStage({
+              name: "volumetricClouds07",
+              fragmentShader: CLOUD_SHADER,
+              textureScale: p.renderScale,
+              pixelDatatype: Cesium.PixelDatatype.HALF_FLOAT,
+              uniforms: Object.assign(this.densityUniforms(), {
+                // 相机在球坐标系里的位置
+                u_cameraPositionSphere: () => this.computeSphereCenter(),
+                u_cameraDirection: () => viewer.camera.directionWC,
+                u_cameraRight: () => viewer.camera.rightWC,
+                u_cameraUp: () => viewer.camera.upWC,
+                u_tanHalfFov: () => this.tanHalfFov(),
+
+                u_stepCount: () => p.stepCount,
+                u_maxDistance: () => p.maxDistance,
+                u_cloudColor: () =>
+                  Cesium.Color.fromCssColorString(p.cloudColor),
+
+                // ===== 场景遮挡 =====
+                u_depthTestEnabled: () => (p.depthTest ? 1 : 0),
+                u_occlusionBandScale: () => p.occlusionBandScale,
+                u_debugSceneDepth: () => (p.debugSceneDepth ? 1 : 0),
+
+                // ===== 光照 =====
+                u_lightingEnabled: () => (p.lightingEnabled ? 1 : 0),
+                // 注意：这里显式转成 Cartesian3 而不是直接传 Cesium.Color。
+                // vec3 uniform 传 Color 在某些情况下拿不到值（实测 u_skyColor 会是 0），
+                // 转成 Cartesian3 最稳妥。
+                u_sunColor: () => this.hexToVec3(p.sunColor),
+                u_skyColor: () => this.hexToVec3(p.skyColor),
+                u_skyLightScale: () => p.skyLightScale,
+                u_albedo: () => p.albedo,
+                u_powderScale: () => p.powderScale,
+                u_powderExponent: () => p.powderExponent,
+                u_multiScatterOctaves: () => p.multiScatterOctaves,
+                u_exposure: () => p.exposure,
+                u_sunStepCount: () => p.sunStepCount,
+                u_sunStepSize: () => p.sunStepSize,
+                u_sunStepScale: () => p.sunStepScale,
+                u_lightDebug: () => p.lightDebug,
+
+                // ===== 本篇新增：阴影图读取端 =====
+                // 用 getter 取 —— 阴影 stage 先执行，轮到云 stage 时纹理已经在了。
+                shadowBuffer: () => this.shadowStage.outputTexture,
+                u_shadowsEnabled: () => (p.shadowsEnabled ? 1 : 0),
+                u_shadowCascadeCount: () => p.shadowCascadeCount,
+                u_shadowTexelSize: () =>
+                  p.shadowCascadeCount / viewer.scene.drawingBufferWidth,
+                u_shadowIntensity: () => p.shadowIntensity,
+                u_shadowBlur: () => p.shadowBlur,
+                u_castShadowOnScene: () => (p.castShadowOnScene ? 1 : 0),
+                u_shadowOnSceneIntensity: () => p.shadowOnSceneIntensity,
+                u_shadowDebug: () => p.shadowDebug,
+
+                // ===== 本篇新增：抖动 =====
+                u_jitter: () => this.jitterOffset(),
+                u_stepJitter: () => this.stepJitter(),
+
+                // ===== 本篇新增：时空蓝噪声 =====
+                // 纹理加载失败时退回 shapeTexture —— 反正 u_useSTBN 会是 0，
+                // 这个采样器根本不会被采到，但 uniform 必须有东西可绑。
+                stbnTexture: () =>
+                  this.volumeTextures.stbn || this.volumeTextures.shape,
+                u_stbnFrame: () => this.frameIndex,
+                u_useSTBN: () =>
+                  p.stbnEnabled && this.volumeTextures.stbn ? 1 : 0,
+
+                // ===== 本篇新增：大气 LUT =====
+                transmittanceTexture: () => this.volumeTextures.atmosphere.transmittance,
+                irradianceTexture: () => this.volumeTextures.atmosphere.irradiance,
+                scatteringTexture: () => this.volumeTextures.atmosphere.scattering,
+                higherOrderScatteringTexture: () =>
+                  this.volumeTextures.atmosphere.higherOrder,
+                u_atmosphereEnabled: () => (p.atmosphereEnabled ? 1 : 0),
+                u_sunIrradianceScale: () => p.sunIrradianceScale,
+                u_skyIrradianceScale: () => p.skyIrradianceScale,
+                u_atmoDebug: () => p.atmoDebug,
+                // 空气透视搬到了这一层，这几个开关也要跟着过来
+                u_aerialPerspective: () => (p.aerialPerspective ? 1 : 0),
+                u_lightShafts: () => (p.lightShafts ? 1 : 0),
+                u_aerialScale: () => p.aerialScale,
+                u_inscatterHueFix: () => (p.inscatterHueFix ? 1 : 0),
+              }),
+            });
+
+            // ===== 本篇新增：composite 交给 buildTemporal 一起建 =====
+            // 07 的 composite 是三个 stage：阴影 → 云层（低分辨率）→ 时间累积合成。
+            // 建它的时候要顺手把累积缓冲、重投影要用的相机基底都准备好，
+            // 所以统一挪到 buildTemporal 里。
+            this.buildTemporal();
+          },
+
+          addlilgui() {
+            let myLilGui = new GUI({ title: "体积云 08 · 大气散射" });
+            this.myLilGui = myLilGui;
+            const p = this.params;
+
+            const cloudFolder = myLilGui.addFolder("云层");
+            cloudFolder.add(p, "baseHeight", 200, 8000, 50).name("云底高度(m)");
+            cloudFolder.add(p, "thickness", 300, 8000, 50).name("云层厚度(m)");
+            cloudFolder.add(p, "densityScale", 0.05, 3, 0.05).name("密度倍率");
+            cloudFolder.add(p, "coverage", 0.05, 0.95, 0.01).name("覆盖率");
+            cloudFolder.addColor(p, "cloudColor").name("云的底色");
+
+            // ===== 本篇新增：形状 =====
+            const shapeFolder = myLilGui.addFolder("形状");
+            shapeFolder
+              .add(p, "shapeAmount", 0, 1, 0.01)
+              .name("形状噪声强度");
+            shapeFolder
+              .add(p, "shapeRepeat", 0.00001, 0.0004, 0.00001)
+              .name("形状纹理密度");
+            shapeFolder
+              .add(p, "shapeDetailAmount", 0, 1, 0.01)
+              .name("细节侵蚀强度");
+            shapeFolder
+              .add(p, "shapeDetailRepeat", 0.001, 0.012, 0.0005)
+              .name("细节纹理密度");
+            shapeFolder
+              .add(p, "shapeAlteringBias", 0.1, 1.5, 0.01)
+              .name("高度梯度偏置");
+
+            // ===== 本篇新增：天气与风 =====
+            const windFolder = myLilGui.addFolder("天气与风");
+            windFolder
+              .add(p, "useWeatherTexture")
+              .name("启用天气图（关掉=均匀云层）");
+            windFolder.add(p, "windDirection", 0, 360, 1).name("风向(度)");
+            windFolder.add(p, "windSpeed", 0, 80, 1).name("风速(m/s)");
+            windFolder
+              .add(p, "windTimeScale", 1, 60, 1)
+              .name("时间倍率(1=实时)");
+            windFolder.add(p, "weatherRepeat", 10, 300, 1).name("天气图平铺");
+            windFolder.add(p, "weatherExponent", 0.2, 4, 0.05).name("天气指数");
+            windFolder.add(p, "turbulenceRepeat", 5, 60, 1).name("湍流平铺");
+            windFolder
+              .add(p, "turbulenceDisplacement", 0, 1000, 10)
+              .name("湍流位移(m)");
+
+            // ===== 本篇新增：云影 =====
+            const shadowFolder = myLilGui.addFolder("云影");
+            shadowFolder
+              .add(p, "shadowsEnabled")
+              .name("启用云影（关掉=第 5 篇）");
+            shadowFolder
+              .add(p, "shadowCascadeCount", { "1 级": 1, "2 级": 2, "3 级": 3 })
+              .name("级联数量");
+            shadowFolder.add(p, "cascadeSize1", 2000, 20000, 500).name("级联 1 边长(m)");
+            shadowFolder.add(p, "cascadeSize2", 5000, 60000, 1000).name("级联 2 边长(m)");
+            shadowFolder.add(p, "cascadeSize3", 20000, 300000, 2000).name("级联 3 边长(m)");
+            shadowFolder.add(p, "shadowStepCount", 4, 64, 1).name("阴影步数");
+            shadowFolder
+              .add(p, "shadowMaxDistance", 5000, 150000, 1000)
+              .name("阴影最远距离(m)");
+            shadowFolder
+              .add(p, "shadowMinDensity", 0.001, 0.2, 0.001)
+              .name("密度阈值");
+            shadowFolder.add(p, "shadowIntensity", 0, 1, 0.01).name("云影强度");
+            shadowFolder.add(p, "shadowBlur", 0, 6, 0.1).name("PCF 半径(纹素)");
+            shadowFolder.add(p, "castShadowOnScene").name("云影投到地面");
+            shadowFolder
+              .add(p, "shadowOnSceneIntensity", 0, 1, 0.01)
+              .name("地面云影强度");
+            shadowFolder
+              .add(p, "shadowDebug", { "关": 0, "地面阴影": 1, "阴影图集": 2 })
+              .name("调试视图");
+
+            // ===== 本篇新增：时间累积 =====
+            const temporalFolder = myLilGui.addFolder("时间累积");
+            temporalFolder
+              .add(p, "temporalEnabled")
+              .name("启用时间累积（关掉=噪点原样）");
+            temporalFolder
+              .add(p, "renderScale", {
+                "1×（全分辨率）": 1,
+                "1/2（像素数 1/4）": 0.5,
+                "1/4（像素数 1/16）": 0.25,
+              })
+              .name("云层渲染分辨率")
+              .onChange(() => this.rebuildAll());
+            temporalFolder.add(p, "temporalAlpha", 0.02, 1, 0.01).name("本帧权重 α");
+            temporalFolder.add(p, "varianceGamma", 0, 4, 0.1).name("方差裁剪 γ");
+            temporalFolder.add(p, "jitterEnabled").name("启用抖动");
+            temporalFolder
+              .add(p, "stbnEnabled")
+              .name("用时空蓝噪声(STBN)当相位");
+
+            // ===== 本篇新增：大气 =====
+            const atmoFolder = myLilGui.addFolder("大气");
+            atmoFolder
+              .add(p, "atmosphereEnabled")
+              .name("启用大气（关掉=第 7 篇）");
+            atmoFolder.add(p, "sunIrradianceScale", 0, 3, 0.01).name("太阳辐照度");
+            atmoFolder
+              .add(p, "skyIrradianceScale", 0, 4, 0.01)
+              .name("天空辐照度（1 = 物理值）");
+            atmoFolder
+              .add(p, "aerialPerspective")
+              .name("空气透视");
+            atmoFolder.add(p, "lightShafts").name("光束");
+            atmoFolder.add(p, "aerialScale", 0, 3, 0.01).name("空气透视强度");
+            atmoFolder
+              .add(p, "inscatterHueFix")
+              .name("in-scatter 色相修正（源库不做）");
+            atmoFolder
+              .add(p, "atmoDebug", { "关": 0, "太阳辐照度": 1, "天空辐照度": 2 })
+              .name("调试视图");
+            temporalFolder
+              .add(p, "temporalDebug", {
+                "关": 0,
+                "只看本帧（低分辨率）": 1,
+                "只看累积缓冲": 2,
+              })
+              .name("调试视图");
+
+            // ===== 时间 =====
+            const timeFolder = myLilGui.addFolder("时间");
+
+            timeFolder
+              .add(p, "timePreset", Object.keys(TIME_PRESETS))
+              .name("跳到")
+              .onChange((v) => this.setTime(TIME_PRESETS[v]));
+            timeFolder
+              .add({ fn: () => this.setTime(TIME_PRESETS["正午 12:00"]) }, "fn")
+              .name("回到正午");
+
+            // ===== 光照 =====
+            const lightFolder = myLilGui.addFolder("光照");
+            lightFolder
+              .add(p, "lightingEnabled")
+              .name("启用光照（关掉=纯白对比）");
+            lightFolder
+              .add(p, "multiScatterOctaves", 1, 12, 1)
+              .name("多重散射阶数（1=单次）");
+            lightFolder
+              .add(p, "powderScale", 0, 1, 0.01)
+              .name("Beer-Powder 强度");
+            lightFolder
+              .add(p, "powderExponent", 1, 400, 1)
+              .name("Beer-Powder 指数");
+            lightFolder
+              .add(p, "exposure", 1, 60, 0.5)
+              .name("曝光（在 RESOLVE 阶段）");
+            lightFolder
+              .add(p, "cloudContrast", 0.3, 2, 0.01)
+              .name("色调曲线对比度");
+            lightFolder
+              .add(p, "lightDebug", {
+                "关": 0, "太阳色": 1, "视线与太阳夹角": 2,
+                "天空光色": 3, "曝光": 4, "太阳方向": 5,
+                "云辐射(未乘曝光)": 6, "云辐射(乘曝光后)": 7,
+              })
+              .name("光照调试视图");
+
+            const lightColorFolder = myLilGui.addFolder("光照颜色");
+            lightColorFolder.addColor(p, "sunColor").name("太阳色");
+            lightColorFolder.addColor(p, "skyColor").name("天空光色");
+            lightColorFolder
+              .add(p, "skyLightScale", 0, 5, 0.05)
+              .name("天空光强度");
+
+            const mediaFolder = myLilGui.addFolder("介质");
+            mediaFolder
+              .add(p, "extinction", 0.0005, 0.02, 0.0005)
+              .name("消光系数");
+            mediaFolder
+              .add(p, "albedo", 0, 1, 0.01)
+              .name("单次散射反照率");
+
+            const sunFolder = myLilGui.addFolder("太阳步进");
+            sunFolder
+              .add(p, "sunStepCount", 1, 16, 1)
+              .name("步进次数");
+            sunFolder
+              .add(p, "sunStepSize", 5, 200, 5)
+              .name("初始步长(m)");
+            sunFolder
+              .add(p, "sunStepScale", 1, 3, 0.1)
+              .name("步长增长");
+
+            // ===== 场景遮挡 =====
+            const occlFolder = myLilGui.addFolder("场景遮挡");
+            occlFolder
+              .add(p, "depthTest")
+              .name("启用深度遮挡");
+            occlFolder
+              .add(p, "occlusionBandScale", 0, 0.2, 0.005)
+              .name("软化带比例");
+            occlFolder
+              .add(p, "debugSceneDepth")
+              .name("显示场景深度（调试）");
+
+            const profileFolder = myLilGui.addFolder("密度剖面");
+            profileFolder
+              .add(p, "profileLinear", 0, 2, 0.01)
+              .name("线性项");
+            profileFolder
+              .add(p, "profileConstant", 0, 1, 0.01)
+              .name("常数项");
+
+            const marchFolder = myLilGui.addFolder("步进");
+            marchFolder.add(p, "stepCount", 8, 512, 1).name("采样步数");
+            marchFolder
+              .add(p, "maxDistance", 5000, 300000, 1000)
+              .name("最远步进距离(m)");
+
+            const viewFolder = myLilGui.addFolder("视图");
+            viewFolder
+              .add({ fn: () => this.resetCamera() }, "fn")
+              .name("重置视角");
+            // ===== 本篇新增：云下视角（光柱和空气透视要在这个视角才看得见）=====
+            viewFolder
+              .add({ preset: "overview" }, "preset", {
+                "俯视云层（7 km）": "overview",
+                "云下仰视（800 m）": "belowClouds",
+              })
+              .name("相机预设")
+              .onChange((v) => this.applyCameraPreset(v));
+
+            const layerFolder = myLilGui.addFolder("图层控制");
+            layerFolder
+              .add(this.imageryLayer, "show")
+              .name("影像图层显示/隐藏");
+            layerFolder
+              .add(this.imageryLayer, "alpha", 0, 1, 0.01)
+              .name("影像图层透明度");
+          },
+
+          // ============================================================
+          // ===== 本篇新增：时间累积 =====
+          // ============================================================
+
+          /** 相机视锥的 tan(半 FOV)，重投影要用 */
+          tanHalfFov() {
+            const f = this.viewer.camera.frustum;
+            const tanY = Math.tan(f.fovy * 0.5);
+            if (!this._tanHalfFov) this._tanHalfFov = new Cesium.Cartesian2();
+            this._tanHalfFov.x = tanY * f.aspectRatio;
+            this._tanHalfFov.y = tanY;
+            return this._tanHalfFov;
+          },
+
+          /** 低分辨率云层的像素尺寸（和 PostProcessStage 内部算法保持一致） */
+          lowResSize() {
+            const scene = this.viewer.scene;
+            const s = Math.max(0.01, Math.min(1, this.params.renderScale));
+            if (!this._lowRes) this._lowRes = new Cesium.Cartesian2();
+            this._lowRes.x = Math.max(1, Math.ceil(scene.drawingBufferWidth * s));
+            this._lowRes.y = Math.max(1, Math.ceil(scene.drawingBufferHeight * s));
+            return this._lowRes;
+          },
+
+          /**
+           * 亚像素抖动：把视线在低分辨率像素内部挪一个亚像素位置。
+           *
+           * 把 16 个 Bayer 相位铺成 4×4 的格，相位 v 对应格点
+           * ((v%4)/4, (v>>2)/4)，再映射到 [-0.5, 0.5) 个低分辨率像素，
+           * 最后除以低分辨率尺寸换成 UV 偏移。
+           */
+          jitterOffset() {
+            if (!this._jit) this._jit = new Cesium.Cartesian2();
+            if (!this.params.jitterEnabled) {
+              this._jit.x = 0;
+              this._jit.y = 0;
+              return this._jit;
+            }
+            const v = bayerPhase(this.frameIndex);
+            const size = this.lowResSize();
+            const gx = ((v & 3) + 0.5) / 4 - 0.5;
+            const gy = ((v >> 2) + 0.5) / 4 - 0.5;
+            this._jit.x = gx / size.x;
+            this._jit.y = gy / size.y;
+            return this._jit;
+          },
+
+          /**
+           * 步进相位抖动：第一步从步长的哪个位置开始走。
+           *
+           * 这一项才是治条带的：固定从 0.5 步长处开始采样，
+           * 误差在屏幕上表现为一层层的同心条带；把相位打散成噪声之后，
+           * 时间累积才能把它平均掉。
+           */
+          stepJitter() {
+            if (!this.params.jitterEnabled) return 0.5;
+            return (bayerPhase(this.frameIndex) + 0.5) / 16.0;
+          },
+
+          /** 记录本帧的相机基底，供下一帧做重投影 */
+          captureCamera() {
+            const cam = this.viewer.camera;
+            const posSphere = this.computeSphereCenter();
+            const centerEcef = Cesium.Cartesian3.subtract(
+              cam.positionWC,
+              posSphere,
+              new Cesium.Cartesian3(),
+            );
+            const tan = this.tanHalfFov();
+            return {
+              camEcef: Cesium.Cartesian3.clone(cam.positionWC),
+              centerEcef,
+              dir: Cesium.Cartesian3.clone(cam.directionWC),
+              right: Cesium.Cartesian3.clone(cam.rightWC),
+              up: Cesium.Cartesian3.clone(cam.upWC),
+              tan: new Cesium.Cartesian2(tan.x, tan.y),
+            };
+          },
+
+          /**
+           * 上一帧的相机位置，重新表达在**当前帧的球坐标系**里。
+           *
+           * 球心跟着相机走（永远是相机正下方 6360 km 处），所以不能
+           * 直接把上一帧的位置拿来用 —— 得先减去当前的球心。
+           */
+          prevCameraPositionSphere() {
+            const cam = this.viewer.camera;
+            if (!this._tmpCenter) {
+              this._tmpCenter = new Cesium.Cartesian3();
+              this._tmpPrevPos = new Cesium.Cartesian3();
+            }
+            if (!this.prevCam) return this.computeSphereCenter();
+            const centerNow = Cesium.Cartesian3.subtract(
+              cam.positionWC,
+              this.computeSphereCenter(),
+              this._tmpCenter,
+            );
+            return Cesium.Cartesian3.subtract(
+              this.prevCam.camEcef,
+              centerNow,
+              this._tmpPrevPos,
+            );
+          },
+
+          /** 时间累积 Pass 的 uniform */
+          temporalUniforms() {
+            const p = this.params;
+            return {
+              colorBuffer: () => this.cloudStage && this.cloudStage.outputTexture,
+              historyBuffer: () => this.history && this.history.read.texture,
+              u_lowResTexel: () => {
+                const s = this.lowResSize();
+                if (!this._lowResTexel) this._lowResTexel = new Cesium.Cartesian2();
+                this._lowResTexel.x = 1 / s.x;
+                this._lowResTexel.y = 1 / s.y;
+                return this._lowResTexel;
+              },
+              u_temporalAlpha: () => (this.resetHistory ? 1.0 : p.temporalAlpha),
+              u_varianceGamma: () => p.varianceGamma,
+              u_debug: () => p.temporalDebug,
+              u_camPos: () => this.computeSphereCenter(),
+              u_camDir: () => this.viewer.camera.directionWC,
+              u_camRight: () => this.viewer.camera.rightWC,
+              u_camUp: () => this.viewer.camera.upWC,
+              u_tanHalfFov: () => this.tanHalfFov(),
+              u_prevCamPos: () => this.prevCameraPositionSphere(),
+              u_prevCamDir: () =>
+                this.prevCam ? this.prevCam.dir : this.viewer.camera.directionWC,
+              u_prevCamRight: () =>
+                this.prevCam ? this.prevCam.right : this.viewer.camera.rightWC,
+              u_prevCamUp: () =>
+                this.prevCam ? this.prevCam.up : this.viewer.camera.upWC,
+              u_prevTanHalfFov: () =>
+                this.prevCam ? this.prevCam.tan : this.tanHalfFov(),
+              // 云壳中面半径，给重投影当「深度」用
+              u_shellRadius: () =>
+                BOTTOM_RADIUS + p.baseHeight + p.thickness * 0.5,
+            };
+          },
+
+          /** 建累积缓冲 + 时间累积 Pass + 合成 Stage，并重装 composite */
+          buildTemporal() {
+            const viewer = this.viewer;
+            const p = this.params;
+            const context = viewer.scene.context;
+
+            this.destroyHistory();
+
+            const w = Math.max(1, viewer.scene.drawingBufferWidth);
+            const h = Math.max(1, viewer.scene.drawingBufferHeight);
+            const pixelDatatype = Cesium.PixelDatatype.HALF_FLOAT;
+
+            // ① 两张全分辨率累积缓冲，ping-pong
+            const read = new RenderTarget(context, { width: w, height: h, pixelDatatype });
+            const write = new RenderTarget(context, { width: w, height: h, pixelDatatype });
+            this.history = Vue.markRaw({
+              read,
+              write,
+              swap() {
+                const t = this.read;
+                this.read = this.write;
+                this.write = t;
+              },
+            });
+
+            // ② 时间累积：渲染到 write
+            this.temporalPass = Vue.markRaw(
+              new FullscreenPass(context, {
+                fragmentShader: TEMPORAL_SHADER,
+                framebuffer: this.history.write.framebuffer,
+                width: w,
+                height: h,
+                uniforms: this.temporalUniforms(),
+              }),
+            );
+
+            // ③ 合成 Stage：把累积结果盖到场景上（地面云影也在这里做）
+            this.resolveStage = new Cesium.PostProcessStage({
+              name: "cloudResolve07",
+              fragmentShader: RESOLVE_SHADER,
+              // densityUniforms 里已经有 u_bottomRadius / u_sunDirection /
+              // 地面坐标系 / 级联边长这些，地面云影正好都要用
+              uniforms: Object.assign(this.densityUniforms(), {
+                cloudBuffer: () => this.cloudStage && this.cloudStage.outputTexture,
+                historyBuffer: () => this.history && this.history.read.texture,
+                u_temporalEnabled: () => (p.temporalEnabled ? 1 : 0),
+                u_temporalDebug: () => p.temporalDebug,
+
+                // ===== 本篇新增：地面云影的 uniform =====
+                // 云影从云层 Pass 搬到了这一层，相关的 uniform 也要跟过来。
+                shadowBuffer: () => this.shadowStage.outputTexture,
+                u_shadowsEnabled: () => (p.shadowsEnabled ? 1 : 0),
+                u_shadowCascadeCount: () => p.shadowCascadeCount,
+                u_shadowTexelSize: () =>
+                  p.shadowCascadeCount / viewer.scene.drawingBufferWidth,
+                u_shadowIntensity: () => p.shadowIntensity,
+                u_shadowBlur: () => p.shadowBlur,
+                u_castShadowOnScene: () => (p.castShadowOnScene ? 1 : 0),
+                u_shadowOnSceneIntensity: () => p.shadowOnSceneIntensity,
+                u_cameraPositionSphere: () => this.computeSphereCenter(),
+                u_cameraDirection: () => viewer.camera.directionWC,
+                u_cameraRight: () => viewer.camera.rightWC,
+                u_cameraUp: () => viewer.camera.upWC,
+                u_tanHalfFov: () => this.tanHalfFov(),
+
+                // ===== 本篇新增：空气透视 + 光束 =====
+                transmittanceTexture: () => this.volumeTextures.atmosphere.transmittance,
+                irradianceTexture: () => this.volumeTextures.atmosphere.irradiance,
+                scatteringTexture: () => this.volumeTextures.atmosphere.scattering,
+                higherOrderScatteringTexture: () =>
+                  this.volumeTextures.atmosphere.higherOrder,
+                u_atmosphereEnabled: () => (p.atmosphereEnabled ? 1 : 0),
+                u_aerialPerspective: () => (p.aerialPerspective ? 1 : 0),
+                u_lightShafts: () => (p.lightShafts ? 1 : 0),
+                u_aerialScale: () => p.aerialScale,
+                u_inscatterHueFix: () => (p.inscatterHueFix ? 1 : 0),
+                u_sunDirection: () => this.computeSunDirection(),
+
+                // ===== 修正：曝光 + 色调映射（对齐源库 ResolvePass）=====
+                u_exposure: () => p.exposure,
+                u_cloudContrast: () => p.cloudContrast,
+              }),
+            });
+
+            // ④ 组装 composite：阴影 → 云层（低分辨率）→ 时间累积合成
+            // ⚠️ composite 的名字必须和里面 stage 的名字**都不一样**：
+            //    Cesium 取「最终输出纹理」时会按名字 getStageByName，
+            //    它会一路搜到嵌套 stage —— 重名的话会拿到里面那个 stage
+            //    的输出，外面这层 composite 的结果就被丢掉了。
+            this.cloudComposite = new Cesium.PostProcessStageComposite({
+              name: "volumetricClouds07Composite",
+              stages: [this.shadowStage, this.cloudStage, this.resolveStage],
+              // false = 每个 stage 都读**原始场景纹理**。默认的 true 会让
+              // 后一个 stage 拿前一个的输出当输入，画面就只剩阴影图了。
+              inputPreviousStageTexture: false,
+            });
+            viewer.scene.postProcessStages.add(this.cloudComposite);
+
+            this.resetHistory = true;
+            this.frameIndex = 0;
+
+            // ⑤ postRender 里跑时间累积 —— 这时候本帧的云层已经渲染完了
+            if (!this._postRenderRemover) {
+              this._postRenderRemover = viewer.scene.postRender.addEventListener(() =>
+                this.runTemporal(),
+              );
+            }
+          },
+
+          /** 每帧一次：把当前帧的云层混合进累积缓冲 */
+          runTemporal() {
+            const viewer = this.viewer;
+            const scene = viewer.scene;
+            if (!this.history || !this.temporalPass) return;
+
+            // 窗口尺寸变了，累积缓冲得按新尺寸重建
+            if (
+              this.history.read.width !== scene.drawingBufferWidth ||
+              this.history.read.height !== scene.drawingBufferHeight
+            ) {
+              this.rebuildAll();
+              return;
+            }
+
+            const stage = this.cloudStage;
+            if (!stage || !stage.outputTexture) return;
+
+            this.resetHistory = this.needResetHistory();
+            try {
+              this.temporalPass.execute();
+            } catch (e) {
+              if (!this._temporalErr) {
+                this._temporalErr = true;
+                console.error("时间累积 Pass 执行失败：", e);
+              }
+              return;
+            }
+            this.history.swap();
+            this.temporalPass.setFramebuffer(this.history.write.framebuffer);
+
+            this.prevCam = this.captureCamera();
+            this.frameIndex++;
+          },
+
+          /**
+           * 什么时候必须把历史整片作废？
+           *   - 参数改了（云本身变了，历史对不上）
+           *   - 相机瞬移（重置视角、跳时间）—— 逐帧位移很大
+           * 注意：相机**连续移动**不算，那正是重投影要处理的场景。
+           */
+          needResetHistory() {
+            const p = this.params;
+            const key = JSON.stringify([
+              p.renderScale, p.jitterEnabled, p.stbnEnabled, p.varianceGamma, p.temporalEnabled,
+              p.stepCount, p.coverage, p.baseHeight, p.thickness, p.densityScale,
+              p.weatherRepeat, p.useWeatherTexture, p.shadowsEnabled,
+              p.lightingEnabled, p.exposure, p.windSpeed, p.timePreset,
+            ]);
+            if (key !== this._paramKey) {
+              this._paramKey = key;
+              return true;
+            }
+            if (!this.prevCam) return true;
+            const cam = this.viewer.camera;
+            if (Cesium.Cartesian3.distance(cam.positionWC, this.prevCam.camEcef) > 500) {
+              return true;
+            }
+            const cosLimit = Math.cos(Cesium.Math.toRadians(8));
+            if (Cesium.Cartesian3.dot(cam.directionWC, this.prevCam.dir) < cosLimit) {
+              return true;
+            }
+            return false;
+          },
+
+          /** 只销毁 GPU 资源，不动 composite */
+          destroyHistory() {
+            if (this.history) {
+              this.history.read.destroy();
+              this.history.write.destroy();
+              this.history = null;
+            }
+            if (this.temporalPass) {
+              this.temporalPass.destroy();
+              this.temporalPass = null;
+            }
+          },
+
+          /**
+           * 拆掉 07 加的这一整套（composite / 云层 Stage / 累积缓冲）。
+           *
+           * ⚠️ 有个坑：Cesium 的 PostProcessStageComposite.destroy()
+           * **会连带销毁它里面的 stage**。而重建时 shadowStage 这些还要接着用，
+           * 所以先把 composite 的 stage 列表摘空，再销毁它自己。
+           */
+          disposeAll() {
+            const viewer = this.viewer;
+            if (!viewer) return;
+            if (this.cloudComposite) {
+              this.cloudComposite._stages = [];
+              viewer.scene.postProcessStages.remove(this.cloudComposite);
+              this.cloudComposite.destroy();
+              this.cloudComposite = null;
+            }
+            for (const key of ["shadowStage", "cloudStage", "resolveStage"]) {
+              if (this[key]) {
+                this[key].destroy();
+                this[key] = null;
+              }
+            }
+            this.destroyHistory();
+            this.prevCam = null;
+            this._paramKey = null;
+          },
+
+          /**
+           * 改渲染分辨率要整套重建 ——
+           * PostProcessStage 的 textureScale 是只读的，改不了。
+           */
+          rebuildAll() {
+            if (!this.viewer) return;
+            this.disposeAll();
+            this.addClouds();
+          },
+
+          resetCamera() {
+            this.applyCameraPreset("overview");
+          },
+
+          /**
+           * ===== 本篇新增：相机预设 =====
+           *
+           * 为什么非要加一个「云下视角」？
+           *
+           * 空气透视和丁达尔光都依赖「视线路径上有没有被云挡过」。
+           * 默认的 7 km 俯视里，视线刚碰到云的前表面就结束了，
+           * 中间那一小段几乎没被别的云挡过 —— 所以出不来光柱。
+           *
+           * 降到云层下方（800 m，云底在 1200 m）朝太阳仰视，
+           * 光从云缝里漏下来，才是丁达尔光经典的样子。
+           */
+          applyCameraPreset(name) {
+            if (!this.viewer) return;
+            if (name === "belowClouds") {
+              // 朝向太阳，让云缝正好逆光
+              this.viewer.camera.setView({
+                destination: Cesium.Cartesian3.fromDegrees(116.4, 39.9, 800),
+                orientation: {
+                  heading: this.sunAzimuth(),
+                  // 平视稍抬，既看得到云层、也看得到地平线那条大气散射的光带
+                  pitch: Cesium.Math.toRadians(4),
+                  roll: 0,
+                },
+              });
+            } else {
+              this.viewer.camera.setView({
+                destination: Cesium.Cartesian3.fromDegrees(116.4, 39.9, 7000),
+                orientation: {
+                  heading: Cesium.Math.toRadians(0),
+                  pitch: Cesium.Math.toRadians(-17),
+                  roll: 0,
+                },
+              });
+            }
+          },
+
+          /** 把太阳方向投到本地 ENU，算出「朝北顺时针」的方位角（弧度） */
+          sunAzimuth() {
+            const origin = Cesium.Cartesian3.fromDegrees(116.4, 39.9, 800);
+            const enu = Cesium.Transforms.eastNorthUpToFixedFrame(origin);
+            const inv = Cesium.Matrix4.inverseTransformation(enu, new Cesium.Matrix4());
+            const local = Cesium.Matrix4.multiplyByPointAsVector(
+              inv, this.computeSunDirection(), new Cesium.Cartesian3());
+            return Math.atan2(local.x, local.y);
+          },
+        },
+      }).mount("#app");
+    </script>
+  </body>
+</html>
